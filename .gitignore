@@ -1,0 +1,56 @@
+HELP.md
+
+# Build artifacts
+target/
+build/
+dist/
+
+# Maven wrapper (keep for portability)
+!.mvn/wrapper/maven-wrapper.jar
+!mvnw
+!mvnw.cmd
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/nb-gradle/
+
+### VS Code ###
+.vscode/
+
+# Logs & temp
+*.log
+*.tmp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Docker
+*.tar
+*.pid
+*.seed
+*.pid.lock
+.dockerignore
+
+# Local env files with real secrets
+.env
+.env.*
+!env.example
