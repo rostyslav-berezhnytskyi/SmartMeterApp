@@ -22,4 +22,4 @@ solis:
     id: ${SOLIS_API_ID}
     secret: ${SOLIS_API_SECRET}
     sn: ${SOLIS_API_SN}
-    timezone: ${SOLIS_TIMEZONE:3}
+    uri: ${SOLIS_URI}

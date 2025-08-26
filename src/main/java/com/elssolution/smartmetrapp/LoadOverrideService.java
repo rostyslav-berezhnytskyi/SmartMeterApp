@@ -25,8 +25,9 @@ public class LoadOverrideService {
     @PostConstruct
     public void setDeltaFromSolisServer() {
         Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
-                solisCloudClientService.testApiConnection();
-        }, 5, 15, TimeUnit.SECONDS);
+//            solisCloudClientService.testInverterDetailEndpoint();
+            System.out.println("result grid power - " + solisCloudClientService.getCurrentGridImportPower());
+        }, 5, 10, TimeUnit.SECONDS);
     }
 
     // ❗ Увімкни або вимкни цей метод для ПРОДАКШЕНУ

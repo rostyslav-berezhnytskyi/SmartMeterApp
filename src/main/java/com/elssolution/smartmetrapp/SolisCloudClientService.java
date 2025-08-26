@@ -27,46 +27,44 @@ public class SolisCloudClientService {
     @Value("${solis.api.secret}")
     private String apiSecret;
 
+    @Value("${solis.api.uri}")
+    private String solisUri;
+
     @Value("${solis.api.sn}")
     private String inverterSn;
 
-    @Value("${solis.api.timezone}")
-    private int timeZone;
-
-    private static final String API_URL = "https://www.soliscloud.com:13333/v1/api/inverterDay";
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-
-    public void testApiConnection() {
+    public Optional<Double> getCurrentGridImportPower() {
         try {
-            // 1️⃣ Формуємо тіло запиту у правильному форматі (без пробілів)
-            String bodyJson = "{\"pageNo\":1,\"pageSize\":10}"; // Вручну, щоб уникнути пробілів
+            // 1️⃣ Тіло запиту — просто SN
+            String bodyJson = String.format("{\"sn\":\"%s\"}", inverterSn);
 
-            // 2️⃣ MD5 тіла (в Base64)
+            // 2️⃣ MD5
             String contentMD5 = calculateContentMD5(bodyJson);
 
-            // 3️⃣ Дата (без лапок навколо 'GMT')
+            // 3️⃣ Дата
             String dateHeader = getGMTDate();
 
-            // 4️⃣ Canonical Path — строго з документа
-            String canonicalPath = "/v1/api/inverterList";
+            // 4️⃣ Endpoint
+            String canonicalPath = "/v1/api/inverterDetail";
 
-            // 5️⃣ Content-Type — важливо: саме "application/json", без charset!
+            // 5️⃣ Content-Type
             String contentType = "application/json";
 
-            // 6️⃣ Формуємо рядок для підпису (як на скріні)
+            // 6️⃣ Рядок для підпису
             String stringToSign = String.join("\n", "POST", contentMD5, contentType, dateHeader, canonicalPath);
 
-            // 7️⃣ Генеруємо підпис
+            // 7️⃣ Підпис
             String signature = generateSignature(stringToSign, apiSecret);
 
-            // 8️⃣ Authorization заголовок
+            // 8️⃣ Authorization
             String authorization = "API " + apiId + ":" + signature;
 
-            // 9️⃣ Створюємо HTTP-запит
+            // 9️⃣ Створення запиту
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create("https://www.soliscloud.com:13333" + canonicalPath))
+                    .uri(URI.create(solisUri + canonicalPath))
                     .header("Content-Type", contentType)
                     .header("Content-MD5", contentMD5)
                     .header("Date", dateHeader)
@@ -74,115 +72,40 @@ public class SolisCloudClientService {
                     .POST(HttpRequest.BodyPublishers.ofString(bodyJson))
                     .build();
 
-            // 🔟 Відправляємо запит
+            // 🔟 Надсилання
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
-            // 🔍 Виводимо всі поля для дебагу
-            System.out.println("\n=== Test inverterList Debug ===");
-            System.out.println("Body JSON:\n" + bodyJson);
-            System.out.println("Content-MD5: " + contentMD5);
-            System.out.println("Date: " + dateHeader);
-            System.out.println("String to Sign:\n" + stringToSign);
-            System.out.println("Signature: " + signature);
-            System.out.println("Authorization: " + authorization);
+            System.out.println("\n=== SolisCloud GridPower Debug (inverterDetail) ===");
             System.out.println("Response Code: " + response.statusCode());
             System.out.println("Response Body:\n" + response.body());
-            System.out.println("===============================");
+            System.out.println("===================================================");
 
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    public Optional<Double> getCurrentGridPower() {
-        try {
-            // 📅 Формат дати для запиту
-            String currentDate = new SimpleDateFormat("yyyy-MM-dd").format(new Date());
-
-            // 🧱 Формуємо тіло запиту (JSON)
-            Map<String, Object> requestBody = new LinkedHashMap<>();
-            requestBody.put("sn", inverterSn);
-            requestBody.put("time", currentDate);
-            requestBody.put("timeZone", timeZone);
-            String bodyJson = objectMapper.writeValueAsString(requestBody);
-
-            // 🧮 Обчислюємо Content-MD5
-            MessageDigest md5 = MessageDigest.getInstance("MD5");
-            byte[] md5Bytes = md5.digest(bodyJson.getBytes(StandardCharsets.UTF_8));
-            String contentMD5 = Base64.getEncoder().encodeToString(md5Bytes);
-
-            // 🕒 Поточна дата у GMT для заголовка Date
-            String dateHeader = getGMTDate();
-
-            // 📜 Canonical Path — строго з документа
-            String canonicalPath = "/v1/api/inverterDay";
-
-            // 🔏 Формуємо рядок для підпису
-            String stringToSign = String.join("\n",
-                    "POST",
-                    contentMD5,
-                    "application/json;charset=UTF-8",
-                    dateHeader,
-                    canonicalPath
-            );
-
-            // 🔐 Генеруємо підпис (signature)
-            Mac mac = Mac.getInstance("HmacSHA1");
-            SecretKeySpec secretKey = new SecretKeySpec(apiSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA1");
-            mac.init(secretKey);
-            byte[] rawHmac = mac.doFinal(stringToSign.getBytes(StandardCharsets.UTF_8));
-            String signature = Base64.getEncoder().encodeToString(rawHmac);
-
-            // 🔐 Authorization заголовок
-            String authorizationHeader = "API " + apiId + ":" + signature;
-
-            // 📤 Формуємо HTTP-запит
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(API_URL))
-                    .header("Content-Type", "application/json;charset=UTF-8")
-                    .header("Content-MD5", contentMD5)
-                    .header("Date", dateHeader)
-                    .header("Authorization", authorizationHeader)
-                    .POST(HttpRequest.BodyPublishers.ofString(bodyJson))
-                    .build();
-
-            // 📬 Відправляємо запит
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-            // 🧾 Debug log
-            System.out.println("\n=== SolisCloud Request Debug ===");
-            System.out.println("Body JSON:\n" + bodyJson);
-            System.out.println("Content-MD5: " + contentMD5);
-            System.out.println("Date: " + dateHeader);
-            System.out.println("String to Sign:\n" + stringToSign);
-            System.out.println("Signature: " + signature);
-            System.out.println("Authorization: " + authorizationHeader);
-            System.out.println("Response Code: " + response.statusCode());
-            System.out.println("Response Body:\n" + response.body());
-            System.out.println("================================");
-
-            // 📦 Обробляємо відповідь
             if (response.statusCode() == 200) {
                 JsonNode root = objectMapper.readTree(response.body());
                 if ("0".equals(root.path("code").asText())) {
-                    JsonNode dataArray = root.path("data");
-                    if (dataArray.isArray() && !dataArray.isEmpty()) {
-                        JsonNode latest = dataArray.get(dataArray.size() - 1);
-                        return Optional.of(latest.path("pSum").asDouble());
+                    JsonNode data = root.path("data");
+
+                    double psum = data.path("psum").asDouble();
+
+                    if (psum < 0) {
+                        System.out.println("Споживає з мережі - " + Math.abs(psum));
+                        return Optional.of(Math.abs(psum));
+                    } else {
+                        System.out.println("Не споживає з мережі");
+                        return Optional.of(0.0);
                     }
                 } else {
-                    log.warn("❗ API returned error code {}: {}", root.path("code").asText(), root.path("msg").asText());
+                    log.warn("API Error: {} - {}", root.path("code").asText(), root.path("msg").asText());
                 }
-            } else {
-                log.error("❗ API HTTP error {}: {}", response.statusCode(), response.body());
             }
 
         } catch (Exception e) {
-            log.error("❌ Exception while calling SolisCloud API: {}", e.getMessage(), e);
+            log.error("❌ Exception in getCurrentGridImportPower (detail): {}", e.getMessage(), e);
         }
 
         return Optional.empty();
     }
+
 
     private String calculateContentMD5(String body) throws Exception {
         MessageDigest md = MessageDigest.getInstance("MD5");
