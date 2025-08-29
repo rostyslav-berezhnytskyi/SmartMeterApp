@@ -89,9 +89,11 @@ public class SolisCloudClientService {
 
                     if (psum < 0) {
                         System.out.println("Споживає з мережі - " + Math.abs(psum));
+                        log.info("Take from grid " + psum);
                         return Optional.of(Math.abs(psum));
                     } else {
                         System.out.println("Не споживає з мережі");
+                        log.info("Take from grid less than 1kW - " + psum);
                         return Optional.of(0.0);
                     }
                 } else {

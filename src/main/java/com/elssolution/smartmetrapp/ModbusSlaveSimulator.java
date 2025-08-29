@@ -5,6 +5,7 @@ import com.serotonin.modbus4j.ModbusSlaveSet;
 import com.serotonin.modbus4j.exception.ModbusInitException;
 import com.serotonin.modbus4j.serial.SerialPortWrapper;
 import com.serotonin.modbus4j.BasicProcessImage;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -14,6 +15,7 @@ import jakarta.annotation.PostConstruct;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+@Slf4j
 @Component
 public class ModbusSlaveSimulator {
 
@@ -40,10 +42,16 @@ public class ModbusSlaveSimulator {
 
             // Зчитати існуючі значення
             float voltageL1 = getFloat(data, 0);
+            System.out.println("voltage from SM - " + voltageL1);
+            log.info("voltage from SM - " + voltageL1);
             float currentL1 = getFloat(data, 6);
+            System.out.println("current from SM - " + currentL1);
+            log.info("current from SM - " + currentL1);
             float power = getFloat(data, 52);  // сумарна потужність
+            System.out.println("power from SM - " + power);
+            log.info("power from SM - " + power);
 
-            float deltaKw = loadOverrideService.getOverrideDeltaKw(); // данні з терміналу
+            float deltaKw = loadOverrideService.getOverrideDeltaKw(); // данні з solis обробленні
             if (deltaKw > 0) {
                 float cosPhi = 0.95f;
 
@@ -67,7 +75,7 @@ public class ModbusSlaveSimulator {
                 processImage.setInputRegister(i, data[i]);
             }
 
-        }, 0, 1, TimeUnit.SECONDS);
+        }, 0, 5, TimeUnit.SECONDS);
     }
 
     @PostConstruct
@@ -86,6 +94,7 @@ public class ModbusSlaveSimulator {
 
             System.out.println("✅ Slave started on " + port);
         } catch (ModbusInitException e) {
+            log.error("Error when start slave - " + e);
             e.printStackTrace();
         }
     }

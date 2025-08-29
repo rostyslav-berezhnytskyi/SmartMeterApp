@@ -2,10 +2,12 @@ package com.elssolution.smartmetrapp;
 
 import com.fazecast.jSerialComm.SerialPort;
 import com.serotonin.modbus4j.serial.SerialPortWrapper;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.InputStream;
 import java.io.OutputStream;
 
+@Slf4j
 public class SerialPortWrapperImpl implements SerialPortWrapper {
 
     private final String portName;
@@ -31,6 +33,7 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
         serialPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, 1000, 1000);
 
         if (!serialPort.openPort()) {
+            log.error("Cant open the port");
             throw new Exception("Не вдалося відкрити порт: " + portName);
         }
     }

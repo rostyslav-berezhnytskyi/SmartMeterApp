@@ -53,6 +53,7 @@ public class ModbusReaderService {
                     Thread.sleep(pollInterval);
                 }
             } catch (Exception e) {
+                log.error("Some exception when start reading - " + e);
                 e.printStackTrace();
             }
         }).start();
