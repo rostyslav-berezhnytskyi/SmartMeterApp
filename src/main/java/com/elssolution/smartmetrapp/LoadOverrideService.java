@@ -33,13 +33,11 @@ public class LoadOverrideService {
                 currentGridPower.ifPresentOrElse(
                         power -> {
                             overrideDeltaKw = power > 1.0 ? (float)(power - 1.0) : 0f;
-                            System.out.println("⚡ Дані з Solis: " + power + " кВт, Δ = " + overrideDeltaKw + " кВт");
                             log.info("⚡ Data from Solis: " + power + " kW, Δ = " + overrideDeltaKw + " kW");
                         },
                         () -> System.out.println("⚠️ Дані з Solis тимчасово недоступні")
                 );
             } catch (Exception e) {
-                System.out.println("❌ Помилка при отриманні даних з Solis: " + e.getMessage());
                 log.error("❌ Error when getting data from Solis: " + e.getMessage());
             }
         }, 5, 10, TimeUnit.SECONDS);

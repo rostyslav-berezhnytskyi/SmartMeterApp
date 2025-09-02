@@ -23,3 +23,26 @@ solis:
     secret: ${SOLIS_API_SECRET}
     sn: ${SOLIS_API_SN}
     uri: ${SOLIS_URI}
+
+logging:
+  level:
+    com:
+      elssolution:
+        smartmetrapp: ${SMARTMETER_LOG_LEVEL:INFO}
+
+smartmetr:
+  cosPhiMin: 0.85
+  smoothingWindow: 5
+  deltaMaxKwPerSec: 2
+  clamp:
+    minKw: 0
+    maxKw: 50
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized

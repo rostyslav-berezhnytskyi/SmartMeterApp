@@ -34,7 +34,8 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
 
         if (!serialPort.openPort()) {
             log.error("Cant open the port");
-            throw new Exception("Не вдалося відкрити порт: " + portName);
+            throw new Exception("Cant open the port: " + portName);
+            // add custom error that will send some sort of warning
         }
     }
 

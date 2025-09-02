@@ -75,10 +75,12 @@ public class SolisCloudClientService {
             // 🔟 Надсилання
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
-            System.out.println("\n=== SolisCloud GridPower Debug (inverterDetail) ===");
-            System.out.println("Response Code: " + response.statusCode());
-            System.out.println("Response Body:\n" + response.body());
-            System.out.println("===================================================");
+            log.debug("\n=== SolisCloud GridPower Debug (inverterDetail) ===");
+            log.info("Response Code: " + response.statusCode());
+//            if (log.isDebugEnabled()) {
+//                log.debug("Solis response: {}", response.body());
+//            }
+            log.debug("Solis response: {}", response.body());
 
             if (response.statusCode() == 200) {
                 JsonNode root = objectMapper.readTree(response.body());
@@ -86,23 +88,29 @@ public class SolisCloudClientService {
                     JsonNode data = root.path("data");
 
                     double psum = data.path("psum").asDouble();
+                    log.info("Real raw data from grid SolisAPI: " + psum);
 
-                    if (psum < 0) {
-                        System.out.println("Споживає з мережі - " + Math.abs(psum));
-                        log.info("Take from grid " + psum);
+                    if (psum < -1.0) {
+                        log.info("Take from grid: " + Math.abs(psum));
                         return Optional.of(Math.abs(psum));
+                    } else if (psum < 0) {
+                        log.info("Take from grid less than 1kW: " + Math.abs(psum));
+                        return Optional.of(0.0);
                     } else {
-                        System.out.println("Не споживає з мережі");
-                        log.info("Take from grid less than 1kW - " + psum);
+                        log.info("Return to grid: " + psum);
                         return Optional.of(0.0);
                     }
                 } else {
-                    log.warn("API Error: {} - {}", root.path("code").asText(), root.path("msg").asText());
+                    log.warn("API responded with error code: {} - msg: {}", response.statusCode(), root.path("msg").asText());
+                    log.warn("Full response body (non-zero code): {}", response.body());
                 }
+            } else {
+                log.error("Non-200 HTTP status: {}", response.statusCode());
+                log.error("Full response body (HTTP error): {}", response.body());
             }
 
         } catch (Exception e) {
-            log.error("❌ Exception in getCurrentGridImportPower (detail): {}", e.getMessage(), e);
+            log.error("Exception in getCurrentGridImportPower (detail): {}", e.getMessage(), e);
         }
 
         return Optional.empty();

@@ -42,13 +42,10 @@ public class ModbusSlaveSimulator {
 
             // Зчитати існуючі значення
             float voltageL1 = getFloat(data, 0);
-            System.out.println("voltage from SM - " + voltageL1);
             log.info("voltage from SM - " + voltageL1);
             float currentL1 = getFloat(data, 6);
-            System.out.println("current from SM - " + currentL1);
             log.info("current from SM - " + currentL1);
             float power = getFloat(data, 52);  // сумарна потужність
-            System.out.println("power from SM - " + power);
             log.info("power from SM - " + power);
 
             float deltaKw = loadOverrideService.getOverrideDeltaKw(); // данні з solis обробленні
@@ -62,7 +59,7 @@ public class ModbusSlaveSimulator {
                 // І відповідно збільшити і потужність
                 power += deltaKw * 1000;
 
-                System.out.printf("⚠️ Додаємо %.2f A до струму (сумарно %.2f A)%n", additionalCurrent, currentL1);
+                log.info("Додаємо %.2f A до струму (сумарно %.2f A)%n", additionalCurrent, currentL1);
             }
 
             // Замінюємо дані
@@ -92,7 +89,7 @@ public class ModbusSlaveSimulator {
 
             startDataFeeder();
 
-            System.out.println("✅ Slave started on " + port);
+            log.info("Slave started on " + port);
         } catch (ModbusInitException e) {
             log.error("Error when start slave - " + e);
             e.printStackTrace();
