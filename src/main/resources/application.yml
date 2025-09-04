@@ -23,6 +23,11 @@ solis:
     secret: ${SOLIS_API_SECRET}
     sn: ${SOLIS_API_SN}
     uri: ${SOLIS_URI}
+  fetch:
+    periodSeconds: 10        # how often to call Solis API
+  minImportKw: 1.0           # ignore grid import below this (deadband)
+  maxDataAgeMs: 300000       # if no API updates for this long, treat delta as 0
+  smoothingFactor: 0.5       # 0..1 (1.0 = no smoothing)
 
 logging:
   level:
@@ -37,6 +42,9 @@ smartmetr:
   clamp:
     minKw: 0
     maxKw: 50
+  staleToZeroMs: 300000
+  rampDownMs: 2000
+  floatOrder: BE
 
 management:
   endpoints:

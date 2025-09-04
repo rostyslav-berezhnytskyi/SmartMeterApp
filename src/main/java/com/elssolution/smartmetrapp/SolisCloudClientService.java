@@ -17,10 +17,15 @@ import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
+/**
+ * HTTP client for SolisCloud: fetches the *raw* inverter detail.
+ * No business rules here — it only returns what the API says.
+ */
 @Slf4j
 @Service
 public class SolisCloudClientService {
 
+    // ----- Config from application.yml / .env -----
     @Value("${solis.api.id}")
     private String apiId;
 
@@ -28,113 +33,110 @@ public class SolisCloudClientService {
     private String apiSecret;
 
     @Value("${solis.api.uri}")
-    private String solisUri;
+    private String solisBaseUri;
 
     @Value("${solis.api.sn}")
     private String inverterSn;
 
+    // ----- HTTP + JSON -----
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public Optional<Double> getCurrentGridImportPower() {
+    // ----- Small constants to avoid magic strings -----
+    private static final String PATH_INVERTER_DETAIL = "/v1/api/inverterDetail";
+    private static final String CONTENT_TYPE_JSON   = "application/json";
+
+    /**
+     * Calls SolisCloud /v1/api/inverterDetail and returns the raw reading.
+     *
+     * @return Optional with {@link SolisReading} when successful; empty if any HTTP/API/JSON error occurs.
+     *         psumKw sign convention (from Solis): + means export to grid, - means import from grid.
+     */
+    public Optional<SolisReading> fetchInverterDetail() {
         try {
-            // 1️⃣ Тіло запиту — просто SN
-            String bodyJson = String.format("{\"sn\":\"%s\"}", inverterSn);
+            // 1) Body: just the inverter SN
+            String bodyJson = "{\"sn\":\"" + inverterSn + "\"}";
 
-            // 2️⃣ MD5
-            String contentMD5 = calculateContentMD5(bodyJson);
+            // 2) Required headers
+            String contentMd5 = md5Base64(bodyJson);
+            String dateHeader = httpDateGmt();
+            String stringToSign = String.join("\n", "POST", contentMd5, CONTENT_TYPE_JSON, dateHeader, PATH_INVERTER_DETAIL);
+            String signature = signHmacSha1(stringToSign, apiSecret);
+            String authHeader = "API " + apiId + ":" + signature;
 
-            // 3️⃣ Дата
-            String dateHeader = getGMTDate();
-
-            // 4️⃣ Endpoint
-            String canonicalPath = "/v1/api/inverterDetail";
-
-            // 5️⃣ Content-Type
-            String contentType = "application/json";
-
-            // 6️⃣ Рядок для підпису
-            String stringToSign = String.join("\n", "POST", contentMD5, contentType, dateHeader, canonicalPath);
-
-            // 7️⃣ Підпис
-            String signature = generateSignature(stringToSign, apiSecret);
-
-            // 8️⃣ Authorization
-            String authorization = "API " + apiId + ":" + signature;
-
-            // 9️⃣ Створення запиту
+            // 3) Build request
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(solisUri + canonicalPath))
-                    .header("Content-Type", contentType)
-                    .header("Content-MD5", contentMD5)
+                    .uri(URI.create(solisBaseUri + PATH_INVERTER_DETAIL))
+                    .header("Content-Type", CONTENT_TYPE_JSON)
+                    .header("Content-MD5", contentMd5)
                     .header("Date", dateHeader)
-                    .header("Authorization", authorization)
+                    .header("Authorization", authHeader)
                     .POST(HttpRequest.BodyPublishers.ofString(bodyJson))
                     .build();
 
-            // 🔟 Надсилання
+            // 4) Send
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
-            log.debug("\n=== SolisCloud GridPower Debug (inverterDetail) ===");
-            log.info("Response Code: " + response.statusCode());
-//            if (log.isDebugEnabled()) {
-//                log.debug("Solis response: {}", response.body());
-//            }
-            log.debug("Solis response: {}", response.body());
-
-            if (response.statusCode() == 200) {
-                JsonNode root = objectMapper.readTree(response.body());
-                if ("0".equals(root.path("code").asText())) {
-                    JsonNode data = root.path("data");
-
-                    double psum = data.path("psum").asDouble();
-                    log.info("Real raw data from grid SolisAPI: " + psum);
-
-                    if (psum < -1.0) {
-                        log.info("Take from grid: " + Math.abs(psum));
-                        return Optional.of(Math.abs(psum));
-                    } else if (psum < 0) {
-                        log.info("Take from grid less than 1kW: " + Math.abs(psum));
-                        return Optional.of(0.0);
-                    } else {
-                        log.info("Return to grid: " + psum);
-                        return Optional.of(0.0);
-                    }
-                } else {
-                    log.warn("API responded with error code: {} - msg: {}", response.statusCode(), root.path("msg").asText());
-                    log.warn("Full response body (non-zero code): {}", response.body());
-                }
-            } else {
-                log.error("Non-200 HTTP status: {}", response.statusCode());
-                log.error("Full response body (HTTP error): {}", response.body());
+            if (response.statusCode() != 200) {
+                log.warn("SolisCloud HTTP error: status={} body={}", response.statusCode(), response.body());
+                return Optional.empty();
             }
 
-        } catch (Exception e) {
-            log.error("Exception in getCurrentGridImportPower (detail): {}", e.getMessage(), e);
-        }
+            // 5) Parse JSON
+            JsonNode root = objectMapper.readTree(response.body());
+            String apiCode = root.path("code").asText("");
+            if (!"0".equals(apiCode)) {
+                log.warn("SolisCloud API error: code={} msg={}", apiCode, root.path("msg").asText(""));
+                if (log.isDebugEnabled()) {
+                    log.debug("SolisCloud full response (non-zero code): {}", response.body());
+                }
+                return Optional.empty();
+            }
 
-        return Optional.empty();
+            JsonNode data = root.path("data");
+            double psumKw = data.path("psum").asDouble(); // + export, - import (Solis convention)
+            long fetchedAtMs = System.currentTimeMillis();
+
+            if (log.isDebugEnabled()) {
+                log.debug("SolisCloud raw reading: psumKw={} ( + export / - import ), fetchedAtMs={}",
+                        psumKw, fetchedAtMs);
+            }
+
+            return Optional.of(new SolisReading(psumKw, fetchedAtMs));
+
+        } catch (Exception ex) {
+            log.warn("SolisCloud request failed: {}", ex.getMessage(), ex);
+            return Optional.empty();
+        }
     }
 
+    // ===== Helpers (tiny and explicit) =====
 
-    private String calculateContentMD5(String body) throws Exception {
+    /** MD5(body) in Base64, as required by Solis API. */
+    private String md5Base64(String s) throws Exception {
         MessageDigest md = MessageDigest.getInstance("MD5");
-        byte[] digest = md.digest(body.getBytes(StandardCharsets.UTF_8));
+        byte[] digest = md.digest(s.getBytes(StandardCharsets.UTF_8));
         return Base64.getEncoder().encodeToString(digest);
     }
 
-    private String getGMTDate() {
+    /** RFC-1123 style GMT date that Solis expects in the Date header. */
+    private String httpDateGmt() {
         SimpleDateFormat sdf = new SimpleDateFormat("EEE, d MMM yyyy HH:mm:ss 'GMT'", Locale.US);
         sdf.setTimeZone(TimeZone.getTimeZone("GMT"));
         return sdf.format(new Date());
     }
 
-    private String generateSignature(String data, String key) throws Exception {
+    /** HMAC-SHA1 signature for the canonical string, then Base64. */
+    private String signHmacSha1(String data, String key) throws Exception {
         Mac mac = Mac.getInstance("HmacSHA1");
-        SecretKeySpec secretKey = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA1");
-        mac.init(secretKey);
-        byte[] hmacBytes = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-        return Base64.getEncoder().encodeToString(hmacBytes);
+        mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA1"));
+        return Base64.getEncoder().encodeToString(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
     }
+
+    /**
+     * Simple DTO for the raw Solis datapoint we care about.
+     * Keep it here for locality, or move to its own file if you prefer.
+     */
+    public record SolisReading(double psumKw, long fetchedAtMs) {}
 }
 

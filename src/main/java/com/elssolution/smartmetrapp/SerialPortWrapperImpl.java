@@ -3,7 +3,9 @@ package com.elssolution.smartmetrapp;
 import com.fazecast.jSerialComm.SerialPort;
 import com.serotonin.modbus4j.serial.SerialPortWrapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 
@@ -12,6 +14,13 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
 
     private final String portName;
     private final int baudRate;
+
+    // Make read/write timeouts configurable (defaults match your current behavior).
+    @Value("${serial.io.readTimeoutMs:1000}")
+    private int readTimeoutMs;
+    @Value("${serial.io.writeTimeoutMs:1000}")
+    private int writeTimeoutMs;
+
     private SerialPort serialPort;
 
     public SerialPortWrapperImpl(String portName, int baudRate) {
@@ -20,62 +29,68 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
     }
 
     @Override
-    public void close() throws Exception {
+    public void open() throws IOException {
         if (serialPort != null && serialPort.isOpen()) {
-            serialPort.closePort();
+            // already open
+            return;
         }
-    }
 
-    @Override
-    public void open() throws Exception {
         serialPort = SerialPort.getCommPort(portName);
         serialPort.setComPortParameters(baudRate, 8, SerialPort.ONE_STOP_BIT, SerialPort.NO_PARITY);
-        serialPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, 1000, 1000);
+        // Use semi-blocking read, which plays well with Modbus4J per-request timeout.
+        serialPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, readTimeoutMs, writeTimeoutMs);
+
+        log.info("serial_open port={} baud={} dataBits=8 stopBits=1 parity=NONE rTimeoutMs={} wTimeoutMs={}",
+                portName, baudRate, readTimeoutMs, writeTimeoutMs);
 
         if (!serialPort.openPort()) {
-            log.error("Cant open the port");
-            throw new Exception("Cant open the port: " + portName);
-            // add custom error that will send some sort of warning
+            log.error("serial_open_failed port={} baud={}", portName, baudRate);
+            throw new IOException("Cannot open serial port: " + portName);
         }
     }
 
     @Override
-    public InputStream getInputStream() {
+    public void close() {
+        if (serialPort != null && serialPort.isOpen()) {
+            try {
+                serialPort.closePort();
+                log.info("serial_closed port={}", portName);
+            } catch (Exception ignore) {
+                // swallow — closing on shutdown shouldn’t blow up the app
+            }
+        }
+    }
+
+    @Override public InputStream getInputStream()  {
         return serialPort.getInputStream();
     }
 
-    @Override
-    public OutputStream getOutputStream() {
+    @Override public OutputStream getOutputStream() {
         return serialPort.getOutputStream();
     }
 
-    @Override
-    public int getBaudRate() {
+    @Override public int getBaudRate() {
         return serialPort.getBaudRate();
     }
 
-    @Override
-    public int getFlowControlIn() {
-        return serialPort.getFlowControlSettings();
+    // Return explicit flow control (NONE) for both directions.
+    @Override public int getFlowControlIn() {
+        return SerialPort.FLOW_CONTROL_DISABLED;
     }
 
-    @Override
-    public int getFlowControlOut() {
-        return serialPort.getFlowControlSettings();
+    @Override public int getFlowControlOut() {
+        return SerialPort.FLOW_CONTROL_DISABLED;
     }
 
-    @Override
-    public int getDataBits() {
+    @Override public int getDataBits() {
         return serialPort.getNumDataBits();
     }
 
-    @Override
-    public int getStopBits() {
+    @Override public int getStopBits() {
         return serialPort.getNumStopBits();
     }
 
-    @Override
-    public int getParity() {
+    @Override public int getParity() {
         return serialPort.getParity();
     }
 }
