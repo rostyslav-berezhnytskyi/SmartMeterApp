@@ -41,30 +41,27 @@ public class SolisCloudClientService {
     // ----- HTTP + JSON -----
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final AlertService alerts;
 
     // ----- Small constants to avoid magic strings -----
     private static final String PATH_INVERTER_DETAIL = "/v1/api/inverterDetail";
     private static final String CONTENT_TYPE_JSON   = "application/json";
 
-    /**
-     * Calls SolisCloud /v1/api/inverterDetail and returns the raw reading.
-     *
-     * @return Optional with {@link SolisReading} when successful; empty if any HTTP/API/JSON error occurs.
-     *         psumKw sign convention (from Solis): + means export to grid, - means import from grid.
-     */
-    public Optional<SolisReading> fetchInverterDetail() {
+    public SolisCloudClientService(AlertService alerts) {
+        this.alerts = alerts;
+    }
+
+
+    public Optional<SolisDetail> fetchInverterDetailRich() {
         try {
-            // 1) Body: just the inverter SN
             String bodyJson = "{\"sn\":\"" + inverterSn + "\"}";
 
-            // 2) Required headers
             String contentMd5 = md5Base64(bodyJson);
             String dateHeader = httpDateGmt();
             String stringToSign = String.join("\n", "POST", contentMd5, CONTENT_TYPE_JSON, dateHeader, PATH_INVERTER_DETAIL);
             String signature = signHmacSha1(stringToSign, apiSecret);
             String authHeader = "API " + apiId + ":" + signature;
 
-            // 3) Build request
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(solisBaseUri + PATH_INVERTER_DETAIL))
                     .header("Content-Type", CONTENT_TYPE_JSON)
@@ -74,38 +71,49 @@ public class SolisCloudClientService {
                     .POST(HttpRequest.BodyPublishers.ofString(bodyJson))
                     .build();
 
-            // 4) Send
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
             if (response.statusCode() != 200) {
                 log.warn("SolisCloud HTTP error: status={} body={}", response.statusCode(), response.body());
+                alerts.raise("SOLIS_DOWN", "HTTP " + response.statusCode(), AlertService.Severity.WARN);
                 return Optional.empty();
             }
 
-            // 5) Parse JSON
-            JsonNode root = objectMapper.readTree(response.body());
+            JsonNode root  = objectMapper.readTree(response.body());
             String apiCode = root.path("code").asText("");
             if (!"0".equals(apiCode)) {
-                log.warn("SolisCloud API error: code={} msg={}", apiCode, root.path("msg").asText(""));
-                if (log.isDebugEnabled()) {
-                    log.debug("SolisCloud full response (non-zero code): {}", response.body());
-                }
+                alerts.raise("SOLIS_DOWN", "API code " + apiCode + " msg=" + root.path("msg").asText(""), AlertService.Severity.WARN);
+                if (log.isDebugEnabled()) log.debug("SolisCloud full response: {}", response.body());
                 return Optional.empty();
             }
 
-            JsonNode data = root.path("data");
-            double psumKw = data.path("psum").asDouble(); // + export, - import (Solis convention)
-            long fetchedAtMs = System.currentTimeMillis();
+            JsonNode d = root.path("data");
+            long nowMs = System.currentTimeMillis();
+
+            // Required / existing
+            double psumKw = d.path("psum").asDouble(); // + export, - import
+
+            // Optional fields (null-safe)
+            Double pacKw = nodeAsNullableDouble(d, "pac");           // kW per spec
+            // dcPac is documented with dcPacStr unit; convert to kW if needed
+            Double dcPacRaw = nodeAsNullableDouble(d, "dcPac");
+            String dcPacUnit = d.path("dcPacStr").asText("");        // "W" or "kW"
+            Double dcPacKw = (dcPacRaw == null) ? null :
+                    ("W".equalsIgnoreCase(dcPacUnit) ? dcPacRaw / 1000.0 : dcPacRaw);
+
+            Double familyLoadKw = nodeAsNullableDouble(d, "familyLoadPower"); // kW
+
+            Integer state = d.path("state").isMissingNode() ? null : d.path("state").asInt();
+            Integer warningInfoData = d.path("warningInfoData").isMissingNode() ? null : d.path("warningInfoData").asInt();
 
             if (log.isDebugEnabled()) {
-                log.debug("SolisCloud raw reading: psumKw={} ( + export / - import ), fetchedAtMs={}",
-                        psumKw, fetchedAtMs);
+                log.debug("Solis rich: psum={}kW, pac={}kW, dcPac={}kW, load={}kW, state={}, warn={}",
+                        psumKw, pacKw, dcPacKw, familyLoadKw, state, warningInfoData);
             }
 
-            return Optional.of(new SolisReading(psumKw, fetchedAtMs));
-
+            alerts.resolve("SOLIS_DOWN"); // success
+            return Optional.of(new SolisDetail(psumKw, pacKw, dcPacKw, familyLoadKw, state, warningInfoData, nowMs));
         } catch (Exception ex) {
-            log.warn("SolisCloud request failed: {}", ex.getMessage(), ex);
+            alerts.raise("SOLIS_DOWN", "Exception: " + ex.getMessage(), AlertService.Severity.ERROR);
             return Optional.empty();
         }
     }
@@ -133,10 +141,24 @@ public class SolisCloudClientService {
         return Base64.getEncoder().encodeToString(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
     }
 
+    private static Double nodeAsNullableDouble(JsonNode n, String field) {
+        JsonNode v = n.path(field);
+        return (v.isMissingNode() || !v.isNumber()) ? null : v.asDouble();
+    }
+
     /**
      * Simple DTO for the raw Solis datapoint we care about.
-     * Keep it here for locality, or move to its own file if you prefer.
      */
     public record SolisReading(double psumKw, long fetchedAtMs) {}
+
+    public record SolisDetail(
+            double psumKw,              // + export, - import (as before)
+            Double pacKw,               // inverter AC output power (kW) — may be null
+            Double dcPacKw,             // PV total DC power (kW) — converted if API returns W
+            Double familyLoadKw,        // site/building load (kW)
+            Integer state,              // 1 online, 2 offline, 3 alarm
+            Integer warningInfoData,    // alarm info integer
+            long fetchedAtMs
+    ) {}
 }
 

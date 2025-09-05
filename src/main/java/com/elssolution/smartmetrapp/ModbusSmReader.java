@@ -52,12 +52,15 @@ public class ModbusSmReader {
     // ==== Scheduler injected by your RuntimeConfig ====
     private final ScheduledExecutorService scheduler;
 
+    private final AlertService alerts;
+
     // ==== Persistent Modbus master (the open serial/RTU connection) ====
     private final Object masterLock = new Object();
     private volatile ModbusMaster master; // created once; reopened on failure
 
-    public ModbusSmReader(ScheduledExecutorService scheduler) {
+    public ModbusSmReader(ScheduledExecutorService scheduler, AlertService alerts) {
         this.scheduler = scheduler;
+        this.alerts = alerts;
     }
 
     @PostConstruct
@@ -99,7 +102,7 @@ public class ModbusSmReader {
             }
 
         } catch (Exception e) {
-            log.warn("modbus_read_failed msg={}", e.getMessage());
+            alerts.raise("METER_DISCONNECTED", "SM read/open failed: " + e.getMessage(), AlertService.Severity.ERROR);
             // Close so the next tick will reopen a fresh port
             closeQuietly();
 
@@ -130,6 +133,7 @@ public class ModbusSmReader {
 
             master = m;
             log.info("meter_port_opened port={} baud={}", port, baudRate);
+            alerts.resolve("METER_DISCONNECTED");
         }
     }
 

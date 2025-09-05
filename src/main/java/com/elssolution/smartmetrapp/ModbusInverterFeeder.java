@@ -5,6 +5,8 @@ import com.serotonin.modbus4j.ModbusFactory;
 import com.serotonin.modbus4j.ModbusSlaveSet;
 import com.serotonin.modbus4j.exception.ModbusInitException;
 import com.serotonin.modbus4j.serial.SerialPortWrapper;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -17,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Component
+@Getter @Setter
 public class ModbusInverterFeeder {
 
     // === Dependencies ===
@@ -24,15 +27,17 @@ public class ModbusInverterFeeder {
     private final ModbusSmReader smReader;            // reads raw data from Smart Meter
     private final LoadOverrideService loadOverride;   // how much extra power (kW) we should compensate
     private final PowerController powerController;    // builds the output Modbus word array for the inverter
+    private final AlertService alerts;
 
     public ModbusInverterFeeder(ScheduledExecutorService scheduler,
                                 ModbusSmReader smReader,
                                 LoadOverrideService loadOverride,
-                                PowerController powerController) {
+                                PowerController powerController, AlertService alerts) {
         this.scheduler = scheduler;
         this.smReader = smReader;
         this.loadOverride = loadOverride;
         this.powerController = powerController;
+        this.alerts = alerts;
     }
 
     // === Config ===
@@ -44,9 +49,6 @@ public class ModbusInverterFeeder {
 
     @Value("${serial.output.baudRate}")
     private int baudRate;
-
-    @Value("${smartmetr.phases:1}")
-    private int phases;
 
     /** How many input registers we initialise/write. Increase if you expose more words. */
     private static final int WRITE_REG_COUNT = 100;
@@ -63,6 +65,11 @@ public class ModbusInverterFeeder {
 
     /** Simple connection flag so the open-loop doesn’t re-open unnecessarily. */
     private volatile boolean isUp = false;
+
+    private short[] outputData;
+
+    private volatile long lastWriteMs = 0L;
+    private volatile long lastBuildMs = 0L;
 
     // === Lifecycle ===
     @PostConstruct
@@ -98,10 +105,11 @@ public class ModbusInverterFeeder {
             }
             log.info("Inverter-slave opened: port={} baud={} registersInit={}",
                     port, baudRate, WRITE_REG_COUNT);
+            alerts.resolve("INVERTER_RTU_DOWN");
         } catch (ModbusInitException e) {
-            log.warn("Inverter-slave open failed (ModbusInit): {}", e.getMessage());
+            alerts.raise("INVERTER_RTU_DOWN", "Inverter-slave open failed (ModbusInit): " + e.getMessage(), AlertService.Severity.ERROR);
         } catch (Exception e) {
-            log.warn("Inverter-slave open failed (unexpected): {}", e.getMessage(), e);
+            alerts.raise("INVERTER_RTU_DOWN", "Inverter-slave open failed (unexpected): " + e.getMessage(), AlertService.Severity.ERROR);
         }
     }
 
@@ -118,6 +126,7 @@ public class ModbusInverterFeeder {
             isUp = false;
         }
         log.info("Inverter-slave closed");
+        lastWriteMs = System.currentTimeMillis();
     }
 
     // === Main output loop ===
@@ -137,7 +146,9 @@ public class ModbusInverterFeeder {
             double compensateKw = loadOverride.getCurrentDeltaKw();  // already smoothed/deadbanded data + grid power from SolisAPI
 
             short[] outputData = powerController.prepareOutputWords(snapshot, compensateKw);
+            setOutputData(outputData);
 
+            lastBuildMs = System.currentTimeMillis();
             if (log.isDebugEnabled()) {
                 log.debug("SM snapshot data: {}", Arrays.toString(snapshot.data));
                 log.debug("Grid import to compensate (kW): {}", compensateKw);
@@ -150,9 +161,10 @@ public class ModbusInverterFeeder {
                 for (int i = 0; i < n; i++) {
                     processImage.setInputRegister(i, outputData[i]);
                 }
+                lastWriteMs = System.currentTimeMillis();
             }
         } catch (Exception e) {
-            log.warn("Inverter-slave write failed: {}", e.getMessage());
+            alerts.raise("INVERTER_WRITE_FAIL", "Inverter-slave write failed: " + e.getMessage(), AlertService.Severity.WARN);
             // Typical causes: serial cable unplugged, device reset. We’ll re-open on the next ensureOpen().
             closeQuietly();
         }

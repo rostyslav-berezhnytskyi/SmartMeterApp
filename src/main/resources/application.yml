@@ -25,9 +25,11 @@ solis:
     uri: ${SOLIS_URI}
   fetch:
     periodSeconds: 10        # how often to call Solis API
-  minImportKw: 1.0           # ignore grid import below this (deadband)
+  minImportKw: 0.2           # ignore grid import below this (deadband)
   maxDataAgeMs: 300000       # if no API updates for this long, treat delta as 0
-  smoothingFactor: 0.5       # 0..1 (1.0 = no smoothing)
+  smoothingFactor: 0.8       # 0..1 (1.0 = no smoothing)
+  # compensation switch (default ON). Can be overridden by env SOLIS_OVERRIDE_ENABLED=true/false
+  overrideEnabled: ${SOLIS_OVERRIDE_ENABLED:true}
 
 logging:
   level:
@@ -54,3 +56,10 @@ management:
   endpoint:
     health:
       show-details: when_authorized
+
+alert:
+  telegram:
+    enabled: ${ALERT_TELEGRAM_ENABLED:false}
+    botToken: ${ALERT_TELEGRAM_BOT_TOKEN:}
+    chatId: ${ALERT_TELEGRAM_CHAT_ID:}
+    cooldownMs: ${ALERT_TELEGRAM_COOLDOWN_MS:900000}  # 15 min

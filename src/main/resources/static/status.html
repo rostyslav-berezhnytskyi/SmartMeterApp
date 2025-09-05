@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>SmartMetr Status</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        :root {
+            --bg: #0f172a;        /* slate-900 */
+            --panel: #111827;     /* gray-900 */
+            --muted: #94a3b8;     /* slate-400 */
+            --fg: #e5e7eb;        /* gray-200 */
+            --accent: #22c55e;    /* green-500 */
+            --warn: #f59e0b;      /* amber-500 */
+            --bad: #ef4444;       /* red-500 */
+            --good: #10b981;      /* emerald-500 */
+            --blue: #60a5fa;
+        }
+
+        /* big number dynamic colors */
+        .value-export { color: var(--blue); }   /* any export */
+        .value-ok     { color: var(--good); }   /* import 0–9.999 kW */
+        .value-warn   { color: var(--warn); }   /* import 10–19.999 kW */
+        .value-bad    { color: var(--bad); }    /* import >= 20 kW */
+        /* compensation "2nd-most important" line */
+        .midline {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 6px 0 8px;
+        }
+        .goodtext { color: var(--good); }
+
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+            background: var(--bg); color: var(--fg);
+        }
+        header {
+            padding: 16px 20px; border-bottom: 1px solid #1f2937; /* gray-800 */
+            display: flex; align-items: center; gap: 12px;        /* <-- center */
+        }
+        header h1 { margin: 0; font-size: 18px; }
+        header .subtitle { color: var(--muted); font-size: 13px; }
+        .wrap {
+            max-width: 1100px; margin: 0 auto; padding: 20px; display: grid; gap: 16px;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        }
+        .card {
+            background: var(--panel); border: 1px solid #1f2937; border-radius: 12px; padding: 14px 14px 8px;
+            box-shadow: 0 4px 18px rgba(0,0,0,0.2);
+        }
+        .card h2 { margin: 0 0 10px; font-size: 15px; color: #d1d5db; }
+        .big {
+            font-size: 28px; font-weight: 600; margin: 6px 0 4px; letter-spacing: 0.2px;
+        }
+        .sub { color: var(--muted); font-size: 12px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 6px 4px; text-align: left; }
+        th { color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 1px dashed #1f2937; }
+        tr + tr td { border-top: 1px dashed #1f2937; }
+        .kpi { display: flex; gap: 16px; flex-wrap: wrap; }
+        .pill {
+            display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #1f2937; color: #cbd5e1;
+        }
+        .alert-item { margin: 4px 0; }
+        .pill.sev-INFO { background: rgba(59,130,246,.12); border-color: rgba(59,130,246,.35); }  /* blue */
+        .pill.sev-WARN { background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.35); }  /* amber */
+        .pill.sev-ERROR, .pill.sev-CRITICAL { background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.35); } /* red */
+        .ok { background: rgba(16,185,129,.12); border-color: rgba(16,185,129,.35); }
+        .warn { background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.35); }
+        .bad { background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.35); }
+        .accent { color: var(--accent); }
+        .muted { color: var(--muted); }
+        .footer { grid-column: 1 / -1; text-align: center; color: var(--muted); font-size: 12px; padding: 8px; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+
+        .brand {
+            margin-left: auto;              /* pushes logo to the right */
+            display: inline-flex;
+            align-items: center;
+        }
+        .brand img {
+            height: 108px;                   /* tweak 24–36px to taste */
+            width: auto;
+            display: block;
+            border-radius: 4px;
+            box-shadow: 0 2px 5px rgba(0,0,0,.35);
+        }
+        @media (max-width: 640px) {
+            .brand img { height: 28px; }
+        }
+
+        /* Make the Alerts card span the whole row */
+        .card.alerts { grid-column: 1 / -1; }
+
+        /* Tidy alert lines: [SEV] [key] message .......... time */
+        .alert-item{
+            display: grid;
+            grid-template-columns: auto auto 1fr auto;
+            gap: 8px;
+            align-items: start;
+            padding: 4px 0;
+            border-top: 1px dashed #1f2937;
+        }
+        .alert-item:first-child { border-top: 0; }
+        .alert-item .msg  { white-space: pre-wrap; word-break: break-word; }
+        .alert-item .time { color: var(--muted); white-space: nowrap; }
+        .alert-list { max-height: 260px; overflow-y: auto; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>SmartMetr Status</h1>
+    <div class="subtitle">auto-refreshing every <span id="refreshSec">3</span>s</div>
+    <div class="subtitle">last update: <span id="lastUpdate" class="mono">-</span></div>
+
+    <!-- ELS logo on the right -->
+    <a class="brand" href="https://www.els-solution.com/" aria-label="ELS">
+        <img src="/img/els-logo.png" alt="ELS logo" />
+    </a>
+</header>
+
+<div class="wrap">
+
+    <!-- Grid / Solis -->
+    <section class="card">
+        <h2>Solis Hybrid Inverter output</h2>
+
+        <!-- BIG headline: import/export with dynamic color -->
+        <div class="big">
+            <span id="gridFlow">-</span>
+            <span id="gridFlowLabel" class="muted">kW importing</span>
+        </div>
+
+        <!-- NEW: compensation as the 2nd-most prominent line -->
+        <div class="midline">
+            <span class="muted">compensation:</span>
+            <span id="compensationBig" class="goodtext">-</span>
+            <span class="muted">kW</span>
+        </div>
+
+        <div class="kpi" style="margin:8px 0 6px;">
+            <span class="pill">mode: <span id="overrideMode" class="mono">-</span></span>
+            <span class="pill">min import: <span id="minImport" class="mono">-</span> kW</span>
+
+            <span class="pill">PV: <span id="pvPower" class="mono">-</span> kW</span>
+            <span class="pill">load: <span id="loadPower" class="mono">-</span> kW</span>
+
+            <span id="alarmPill" class="pill ok">alarm: <span id="alarmTxt">no</span></span>
+            <span id="statePill" class="pill ok">state: <span id="solisState" class="mono">-</span></span>
+
+            <span id="gridAgePill" class="pill ok">age: <span id="gridAge">-</span></span>
+        </div>
+    </section>
+
+    <!-- Smart Meter (live) -->
+    <section class="card">
+        <h2>Smart Meter</h2>
+        <table>
+            <thead><tr><th>Phase</th><th>Voltage (V)</th><th>Current (A)</th></tr></thead>
+            <tbody>
+            <tr><td>L1</td><td class="mono" id="smV1">-</td><td class="mono" id="smI1">-</td></tr>
+            <tr><td>L2</td><td class="mono" id="smV2">-</td><td class="mono" id="smI2">-</td></tr>
+            <tr><td>L3</td><td class="mono" id="smV3">-</td><td class="mono" id="smI3">-</td></tr>
+            </tbody>
+        </table>
+        <div class="kpi" style="margin-top:8px;">
+            <span class="pill">P total: <span id="smPTotal" class="mono">-</span> W</span>
+            <span id="smAgePill" class="pill ok">age: <span id="smAge">-</span></span>
+        </div>
+    </section>
+
+    <!-- Output we publish to inverter -->
+    <section class="card">
+        <h2>Solis Grid-tie Inverter input</h2>
+        <table>
+            <thead><tr><th>Phase</th><th>Current (A)</th></tr></thead>
+            <tbody>
+            <tr><td>L1</td><td class="mono" id="outI1">-</td></tr>
+            <tr><td>L2</td><td class="mono" id="outI2">-</td></tr>
+            <tr><td>L3</td><td class="mono" id="outI3">-</td></tr>
+            </tbody>
+        </table>
+        <div class="kpi" style="margin-top:8px;">
+            <span class="pill">P total: <span id="outPTotal" class="mono">-</span> W</span>
+            <span id="outAgePill" class="pill ok">age: <span id="outAge">-</span></span>
+        </div>
+    </section>
+
+    <section class="card alerts">
+        <h2>Alerts</h2>
+        <div id="activeAlerts"></div>
+        <div class="sub" style="margin-top:8px;">Recent (last 10)</div>
+        <div id="recentAlerts" class="mono alert-list" style="font-size:12px;"></div>
+    </section>
+
+    <div class="footer muted">Powered by SmartMetrApp — polling <code class="mono">/status</code></div>
+</div>
+
+<script>
+    const REFRESH_MS = 3000;
+    document.getElementById('refreshSec').textContent = (REFRESH_MS/1000);
+
+    function fmt(v) {
+        if (v === null || v === undefined) return "-";
+        if (typeof v === 'number' && Number.isNaN(v)) return "-";
+        return String(v);
+    }
+    function humanAge(ms) {
+        if (ms == null || ms < 0) return "-";
+        if (ms < 1000) return ms + " ms";
+        const s = Math.floor(ms / 1000);
+        if (s < 60) return s + " s";
+        const m = Math.floor(s / 60);
+        const rem = s % 60;
+        return `${m} min ${rem} s`;
+    }
+    function ageClass(ms) {
+        // green <15s, amber <60s, red otherwise (tune these thresholds as you like)
+        if (ms < 0) return "warn";
+        if (ms <= 15000) return "ok";
+        if (ms <= 60000) return "warn";
+        return "bad";
+    }
+    function setPill(id, msText, cls) {
+        const pill = document.getElementById(id + "Pill");
+        const span = document.getElementById(id);
+        pill.classList.remove("ok","warn","bad");
+        pill.classList.add(cls);
+        span.textContent = msText;
+    }
+    function toFixedOrDash(n, digits) {
+        if (typeof n !== 'number' || Number.isNaN(n)) return "-";
+        return n.toFixed(digits);
+    }
+
+    async function refresh() {
+        try {
+            const res = await fetch("./status", { cache: "no-store" });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const v = await res.json();
+
+            // ===== Grid / Solis =====
+            const psum = v.gridRawPsumKw;      // + export, - import
+            const magnitude = (typeof psum === 'number' && !Number.isNaN(psum)) ? Math.abs(psum) : 0;
+
+            const flowEl = document.getElementById("gridFlow");
+            const labelEl = document.getElementById("gridFlowLabel");
+
+            // set number (abs) and the importing/exporting label
+            flowEl.textContent = toFixedOrDash(magnitude, 3);
+            const exporting = (typeof psum === 'number' && psum > 0);
+            labelEl.textContent = exporting ? "kW exporting" : "kW importing";
+
+            // color the big number
+            flowEl.classList.remove("value-export","value-ok","value-warn","value-bad");
+            if (exporting) {
+                // Export: always blue
+                flowEl.classList.add("value-export");
+            } else {
+                // Import: green <10 kW, orange 10–19.999 kW, red >=20 kW
+                if (magnitude >= 20)      flowEl.classList.add("value-bad");
+                else if (magnitude >= 10) flowEl.classList.add("value-warn");
+                else                      flowEl.classList.add("value-ok");
+            }
+
+            // show compensation in bigger green text
+            document.getElementById("compensationBig").textContent = toFixedOrDash(v.compensationKw, 3);
+
+            // keep the small minImport & age pills
+            document.getElementById("minImport").textContent  = toFixedOrDash(v.minImportKw, 3);
+            setPill("gridAge", v.gridAgeHuman || humanAge(v.gridAgeMs), ageClass(v.gridAgeMs));
+
+            // Solis Inverter Additional info
+            document.getElementById("pvPower").textContent   = toFixedOrDash(v.pvPowerKw, 3);
+            document.getElementById("loadPower").textContent = toFixedOrDash(v.loadPowerKw, 3);
+            document.getElementById("solisState").textContent = v.solisState || "-";
+
+            // alarm pill style
+            const alarm = !!v.alarm;
+            const alarmPill = document.getElementById("alarmPill");
+            const alarmTxt = document.getElementById("alarmTxt");
+            alarmPill.classList.remove("ok","warn","bad");
+            if (v.solisState === "OFFLINE") {
+                alarmPill.classList.add("warn");
+                alarmTxt.textContent = "offline";
+            } else if (alarm) {
+                alarmPill.classList.add("bad");
+                alarmTxt.textContent = "yes";
+            } else {
+                alarmPill.classList.add("ok");
+                alarmTxt.textContent = "no";
+            }
+            const statePill = document.getElementById("statePill");
+            statePill.classList.remove("ok","warn","bad");
+            document.getElementById("solisState").textContent = v.solisState || "-";
+            if (v.solisState === "ONLINE")      statePill.classList.add("ok");
+            else                                 statePill.classList.add("bad");
+
+            // Smart meter
+            document.getElementById("smV1").textContent = toFixedOrDash(v.smV1, 1);
+            document.getElementById("smI1").textContent = toFixedOrDash(v.smI1, 2);
+            document.getElementById("smV2").textContent = toFixedOrDash(v.smV2, 1);
+            document.getElementById("smI2").textContent = toFixedOrDash(v.smI2, 2);
+            document.getElementById("smV3").textContent = toFixedOrDash(v.smV3, 1);
+            document.getElementById("smI3").textContent = toFixedOrDash(v.smI3, 2);
+            document.getElementById("smPTotal").textContent = fmt(v.smPTotalW);
+            setPill("smAge", v.smAgeHuman || humanAge(v.smAgeMs), ageClass(v.smAgeMs));
+
+            // Output
+            document.getElementById("outI1").textContent = toFixedOrDash(v.outI1, 2);
+            document.getElementById("outI2").textContent = toFixedOrDash(v.outI2, 2);
+            document.getElementById("outI3").textContent = toFixedOrDash(v.outI3, 2);
+            document.getElementById("outPTotal").textContent = fmt(v.outPTotalW);
+            setPill("outAge", v.outAgeHuman || humanAge(v.outAgeMs), ageClass(v.outAgeMs));
+
+            // Last update clock
+            document.getElementById("lastUpdate").textContent = new Date().toLocaleTimeString();
+
+            // ON/OFF mode
+            document.getElementById("overrideMode").textContent = v.mode || (v.overrideEnabled ? "NORMAL" : "PASS-THRU");
+
+
+        } catch (e) {
+            console.error("refresh failed", e);
+        }
+
+    }
+    async function refreshAlerts() {
+        try {
+            const res = await fetch("./alerts", { cache: "no-store" });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const a = await res.json();
+
+            const activeDiv = document.getElementById("activeAlerts");
+            const recentDiv = document.getElementById("recentAlerts");
+            activeDiv.innerHTML = "";
+            recentDiv.innerHTML = "";
+
+            // ---- ACTIVE (ongoing) ----
+            if (!a || !Array.isArray(a.active) || a.active.length === 0) {
+                activeDiv.innerHTML = '<span class="pill ok">all clear</span>';
+            } else {
+                a.active.forEach(x => {
+                    const age = humanAge(Date.now() - x.lastSeen);
+                    activeDiv.insertAdjacentHTML(
+                        "beforeend",
+                        `<div class="alert-item">
+             <span class="pill sev-${x.severity}">${x.severity}</span>
+             <span class="mono">[${x.key}]</span>
+             <span class="msg">${x.message}</span>
+             <span class="time">last seen ${age} · count ${x.count}</span>
+           </div>`
+                    );
+                });
+            }
+
+            // ---- RECENT (dedup + newest first + limit 10) ----
+            const rec = Array.isArray(a.recent) ? a.recent.slice() : [];
+
+            // Normalize + sort by time ASC (backend may not be sorted)
+            rec.forEach(ev => {
+                // if your backend returns seconds, this converts to ms automatically
+                ev._ts = (typeof ev.ts === "number" && ev.ts < 1e12) ? ev.ts * 1000 : ev.ts;
+            });
+            rec.sort((x, y) => x._ts - y._ts);
+
+            // Collapse bursts of identical messages that occur close together
+            const GAP_MS = 5000; // 5s window -> adjust to taste
+            const buckets = [];
+            for (const ev of rec) {
+                const last = buckets[buckets.length - 1];
+                if (
+                    last &&
+                    last.key === ev.key &&
+                    last.severity === ev.severity &&
+                    last.message === ev.message &&
+                    (ev._ts - last.lastTs) <= GAP_MS
+                ) {
+                    last.lastTs = ev._ts;
+                    last.count += 1;
+                } else {
+                    buckets.push({
+                        key: ev.key,
+                        severity: ev.severity,
+                        type: ev.type,           // e.g., RAISE/CLEAR if you send it
+                        message: ev.message,
+                        firstTs: ev._ts,
+                        lastTs: ev._ts,
+                        count: 1
+                    });
+                }
+            }
+
+            // Take newest 10 collapsed items and render newest first
+            const last10 = buckets.slice(-10).reverse();
+            last10.forEach(b => {
+                const when = new Date(b.lastTs).toLocaleTimeString();
+                const countStr = b.count > 1 ? ` ×${b.count}` : "";
+                recentDiv.insertAdjacentHTML(
+                    "beforeend",
+                    `<div class="alert-item">
+           <span class="pill sev-${b.severity}">${b.type || b.severity}</span>
+           <span class="mono">[${b.key}]</span>
+           <span class="msg">${b.message}${countStr}</span>
+           <span class="time">${when}</span>
+         </div>`
+                );
+            });
+        } catch (e) {
+            console.error("refreshAlerts failed", e);
+            const activeDiv = document.getElementById("activeAlerts");
+            if (activeDiv) activeDiv.innerHTML = '<span class="pill warn">alerts unavailable</span>';
+        }
+    }
+
+    refresh();
+    refreshAlerts();
+    setInterval(refresh, REFRESH_MS);
+    setInterval(refreshAlerts, REFRESH_MS);
+</script>
+</body>
+</html>
