@@ -62,8 +62,6 @@ smartmetr:
   floatOrder: ${SMARTMETR_FLOAT_ORDER:BE}
 
 management:
-  server:
-    address: ${TAILSCALE_IP:127.0.0.1}     # <-- IP Tailscale IPv4
   endpoints:
     web:
       base-path: ${MANAGEMENT_BASE_PATH:/_manage}
