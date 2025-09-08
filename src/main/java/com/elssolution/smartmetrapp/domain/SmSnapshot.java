@@ -1,4 +1,4 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.domain;
 
 /** Immutable meter snapshot: raw words + read timestamp. */
 public final class SmSnapshot {

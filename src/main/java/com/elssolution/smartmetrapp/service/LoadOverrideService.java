@@ -1,5 +1,7 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.service;
 
+import com.elssolution.smartmetrapp.alerts.AlertService;
+import com.elssolution.smartmetrapp.integration.solis.SolisCloudClient;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.Setter;
@@ -18,7 +20,7 @@ import java.util.concurrent.ScheduledExecutorService;
 @Getter @Setter
 public class LoadOverrideService {
 
-    private final SolisCloudClientService solis;
+    private final SolisCloudClient solis;
     private final ScheduledExecutorService scheduler;
     private final AlertService alerts;
 
@@ -64,7 +66,7 @@ public class LoadOverrideService {
 
     private Double[] solisOutputData = new Double[4];
 
-    public LoadOverrideService(SolisCloudClientService solis, ScheduledExecutorService scheduler, AlertService alerts) {
+    public LoadOverrideService(SolisCloudClient solis, ScheduledExecutorService scheduler, AlertService alerts) {
         this.solis = solis;
         this.scheduler = scheduler;
         this.alerts = alerts;
@@ -82,7 +84,7 @@ public class LoadOverrideService {
     /** One safe polling cycle: fetch raw psum from Solis and update delta. */
     private void pollOnceSafe() {
         try {
-            Optional<SolisCloudClientService.SolisDetail> opt = solis.fetchInverterDetailRich();
+            Optional<SolisCloudClient.SolisDetail> opt = solis.fetchInverterDetailRich();
             if (opt.isEmpty()) {
                 decayToZeroIfTooOld();
                 return;

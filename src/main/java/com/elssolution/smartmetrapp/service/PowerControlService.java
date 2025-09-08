@@ -1,8 +1,14 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.service;
 
+import com.elssolution.smartmetrapp.domain.MeterDecoder;
+import com.elssolution.smartmetrapp.domain.MeterRegisterMap;
+import com.elssolution.smartmetrapp.domain.SmSnapshot;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+
+import static com.elssolution.smartmetrapp.domain.Maths.clamp;
+import static com.elssolution.smartmetrapp.domain.Maths.safeDiv;
 
 /**
  * Builds the Modbus output words for the inverter:
@@ -10,18 +16,17 @@ import org.springframework.stereotype.Component;
  * - if fresh -> add compensated power evenly across 3 phases (adjust currents; bump total power)
  *
  * Notes:
- * - We assume a 3-phase layout by default. If your map doesn’t expose L2/L3 yet, those offsets
- *   can be set to -1, and we will skip them safely.
+ * - We assume a 3-phase layout by default.
  * - All calculations use IEEE754 floats on the wire (handled by MeterCodec).
  */
 @Slf4j
 @Component
-public class PowerController {
+public class PowerControlService {
 
-    private final MeterCodec codec;
-    private final MeterMap registerMap;
+    private final MeterDecoder codec;
+    private final MeterRegisterMap registerMap;
 
-    public PowerController(MeterCodec codec, MeterMap registerMap) {
+    public PowerControlService(MeterDecoder codec, MeterRegisterMap registerMap) {
         this.codec = codec;
         this.registerMap = registerMap;
     }
@@ -49,7 +54,7 @@ public class PowerController {
                 ? snapshot.data.clone()
                 : new short[len];
 
-        if (!isRecent(snapshot, maxDataAgeMs)) {
+        if (!isRecent(snapshot, maxDataAgeMs) || isOffline(outWords)) {
             long age = (snapshot == null) ? -1L : (System.currentTimeMillis() - snapshot.updatedAtMs);
             log.info("meter_data_stale ageMs={} → driving currents & powers to 0", age);
             driveToNeutral(outWords);
@@ -103,12 +108,12 @@ public class PowerController {
      */
     private void applyCompensationThreePhase(short[] words, double compensateKw) {
         final double pf = clamp(minPowerFactor, 0.1, 1.0);
-        final double perPhaseKw = compensateKw / 3.0;
+        final double perPhaseKw = safeDiv(compensateKw, 3.0);
 
         // L1
         double v1 = readSafe(words, registerMap.vL1());
         double i1 = readSafe(words, registerMap.iL1());
-        double addI1 = (perPhaseKw * 1000.0) / Math.max(100.0, v1 * pf);
+        double addI1 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v1 * pf)));
         i1 += addI1;
         writeIfPresent(words, registerMap.iL1(), (float) i1);
 
@@ -116,7 +121,7 @@ public class PowerController {
         if (hasRegister(registerMap.vL2()) && hasRegister(registerMap.iL2())) {
             double v2 = readSafe(words, registerMap.vL2());
             double i2 = readSafe(words, registerMap.iL2());
-            double addI2 = (perPhaseKw * 1000.0) / Math.max(100.0, v2 * pf);
+            double addI2 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v2 * pf)));
             i2 += addI2;
             writeIfPresent(words, registerMap.iL2(), (float) i2);
         }
@@ -125,7 +130,7 @@ public class PowerController {
         if (hasRegister(registerMap.vL3()) && hasRegister(registerMap.iL3())) {
             double v3 = readSafe(words, registerMap.vL3());
             double i3 = readSafe(words, registerMap.iL3());
-            double addI3 = (perPhaseKw * 1000.0) / Math.max(100.0, v3 * pf);
+            double addI3 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v3 * pf)));
             i3 += addI3;
             writeIfPresent(words, registerMap.iL3(), (float) i3);
         }
@@ -139,10 +144,6 @@ public class PowerController {
         bumpPerPhasePower(words, (float) perPhaseKw);
 
         log.debug("compensation_applied totalAddKw={} perPhaseKw={} pf={}", compensateKw, perPhaseKw, pf);
-    }
-
-    private static double clamp(double v, double lo, double hi) {
-        return Math.max(lo, Math.min(hi, v));
     }
 
     private void bumpPerPhasePower(short[] words, float perPhaseKw) {
@@ -181,5 +182,13 @@ public class PowerController {
         float delta = target - current;
         float step = Math.abs(delta) * perSec;
         return current + Math.copySign(Math.min(Math.abs(delta), step), delta);
+    }
+
+    /** Treat meter offline/zero-volt as stale and command zeros */
+    private boolean isOffline(short[] words) {
+        double v1 = readSafe(words, registerMap.vL1());
+        double v2 = hasRegister(registerMap.vL2()) ? readSafe(words, registerMap.vL2()) : v1;
+        double v3 = hasRegister(registerMap.vL3()) ? readSafe(words, registerMap.vL3()) : v1;
+        return (v1 < 1.0 && v2 < 1.0 && v3 < 1.0);
     }
 }

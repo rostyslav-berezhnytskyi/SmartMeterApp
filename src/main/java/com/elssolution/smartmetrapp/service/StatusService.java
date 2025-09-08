@@ -1,5 +1,10 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.service;
 
+import com.elssolution.smartmetrapp.domain.MeterDecoder;
+import com.elssolution.smartmetrapp.domain.MeterRegisterMap;
+import com.elssolution.smartmetrapp.domain.SmSnapshot;
+import com.elssolution.smartmetrapp.integration.modbus.ModbusInverterFeeder;
+import com.elssolution.smartmetrapp.integration.modbus.ModbusSmReader;
 import jakarta.annotation.PostConstruct;
 import lombok.Builder;
 import lombok.Value;
@@ -20,11 +25,11 @@ public class StatusService {
     private static final DecimalFormat DF3 = new DecimalFormat("#0.000");
 
     private final ScheduledExecutorService scheduler;
-    private final ModbusSmReader            smReader;
-    private final LoadOverrideService       loadOverride;
-    private final MeterCodec                codec;
-    private final MeterMap                  map;
-    private final ModbusInverterFeeder      feeder;
+    private final ModbusSmReader smReader;
+    private final LoadOverrideService loadOverride;
+    private final MeterDecoder codec;
+    private final MeterRegisterMap map;
+    private final ModbusInverterFeeder feeder;
 
     // How often the human-friendly summary INFO line is printed
     private final int summaryEverySec = 30;
@@ -32,8 +37,8 @@ public class StatusService {
     public StatusService(ScheduledExecutorService scheduler,
                          ModbusSmReader smReader,
                          LoadOverrideService loadOverride,
-                         MeterCodec codec,
-                         MeterMap map,
+                         MeterDecoder codec,
+                         MeterRegisterMap map,
                          ModbusInverterFeeder feeder) {
         this.scheduler    = scheduler;
         this.smReader     = smReader;

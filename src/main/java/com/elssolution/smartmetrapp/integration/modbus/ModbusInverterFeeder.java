@@ -1,5 +1,9 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.integration.modbus;
 
+import com.elssolution.smartmetrapp.domain.SmSnapshot;
+import com.elssolution.smartmetrapp.alerts.AlertService;
+import com.elssolution.smartmetrapp.service.LoadOverrideService;
+import com.elssolution.smartmetrapp.service.PowerControlService;
 import com.serotonin.modbus4j.BasicProcessImage;
 import com.serotonin.modbus4j.ModbusFactory;
 import com.serotonin.modbus4j.ModbusSlaveSet;
@@ -26,17 +30,17 @@ public class ModbusInverterFeeder {
     private final ScheduledExecutorService scheduler;
     private final ModbusSmReader smReader;            // reads raw data from Smart Meter
     private final LoadOverrideService loadOverride;   // how much extra power (kW) we should compensate
-    private final PowerController powerController;    // builds the output Modbus word array for the inverter
+    private final PowerControlService powerControlService;    // builds the output Modbus word array for the inverter
     private final AlertService alerts;
 
     public ModbusInverterFeeder(ScheduledExecutorService scheduler,
                                 ModbusSmReader smReader,
                                 LoadOverrideService loadOverride,
-                                PowerController powerController, AlertService alerts) {
+                                PowerControlService powerControlService, AlertService alerts) {
         this.scheduler = scheduler;
         this.smReader = smReader;
         this.loadOverride = loadOverride;
-        this.powerController = powerController;
+        this.powerControlService = powerControlService;
         this.alerts = alerts;
     }
 
@@ -145,7 +149,7 @@ public class ModbusInverterFeeder {
             SmSnapshot snapshot = smReader.getLatestSnapshotSM();    // raw data from SM + timestamp of read
             double compensateKw = loadOverride.getCurrentDeltaKw();  // already smoothed/deadbanded data + grid power from SolisAPI
 
-            short[] outputData = powerController.prepareOutputWords(snapshot, compensateKw);
+            short[] outputData = powerControlService.prepareOutputWords(snapshot, compensateKw);
             setOutputData(outputData);
 
             lastBuildMs = System.currentTimeMillis();

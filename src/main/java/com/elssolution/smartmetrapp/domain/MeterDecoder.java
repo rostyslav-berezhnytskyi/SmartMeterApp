@@ -1,4 +1,4 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.domain;
 
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
@@ -11,7 +11,7 @@ import org.springframework.stereotype.Component;
  *   LE (Little Endian) = low word first  (w[off] = LO, w[off+1] = HI)
  */
 @Component
-public class MeterCodec {
+public class MeterDecoder {
 
     public enum WordOrder { BE, LE }
 

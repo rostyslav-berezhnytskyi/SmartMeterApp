@@ -1,4 +1,4 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.integration.modbus;
 
 import com.fazecast.jSerialComm.SerialPort;
 import com.serotonin.modbus4j.serial.SerialPortWrapper;
@@ -31,8 +31,7 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
     @Override
     public void open() throws IOException {
         if (serialPort != null && serialPort.isOpen()) {
-            // already open
-            return;
+            return; // already open
         }
 
         serialPort = SerialPort.getCommPort(portName);
@@ -46,6 +45,21 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
         if (!serialPort.openPort()) {
             log.error("serial_open_failed port={} baud={}", portName, baudRate);
             throw new IOException("Cannot open serial port: " + portName);
+        } else {
+            // ---- fallback “flush”: drain any junk from RX and give UART a tick to settle ----
+            try {
+                var in = serialPort.getInputStream();
+                byte[] buf = new byte[256];
+                long stop = System.currentTimeMillis() + 100; // cap at ~100ms
+                while (System.currentTimeMillis() < stop && in.available() > 0) {
+                    int n = in.read(buf, 0, Math.min(buf.length, Math.max(1, in.available())));
+                    if (n <= 0) break;
+                }
+            } catch (Exception ignore) { /* best-effort drain */ }
+
+            try { serialPort.getOutputStream().flush(); } catch (Exception ignore) { /* may be no-op */ }
+
+            try { Thread.sleep(150); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
     }
 

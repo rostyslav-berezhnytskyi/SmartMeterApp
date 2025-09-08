@@ -1,11 +1,11 @@
-package com.elssolution.smartmetrapp;
+package com.elssolution.smartmetrapp.domain;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 /** Word offsets for each register. Use -1 for “not mapped”. */
 @Component
-public class MeterMap {
+public class MeterRegisterMap {
 
     // SDM630 defaults (adjust when you move to Acrel)
     @Value("${meterMap.vL1:0}")     private int vL1;

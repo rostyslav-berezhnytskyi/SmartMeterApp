@@ -90,22 +90,32 @@
             .brand img { height: 28px; }
         }
 
-        /* Make the Alerts card span the whole row */
-        .card.alerts { grid-column: 1 / -1; }
+        /* Alerts should be full-width and stable height */
+        .card.alerts {
+            grid-column: 1 / -1;   /* <— span the entire grid row */
+            min-height: 180px;     /* keep it from collapsing */
+        }
 
-        /* Tidy alert lines: [SEV] [key] message .......... time */
+        /* ACTIVE area always at least one row tall */
+        #activeAlerts { min-height: 38px; }
+
+        /* Last alert: exactly one row, no growth */
+        #lastAlertRow {
+            height: 38px;
+            display: grid;
+            align-items: center;
+            overflow: hidden;   /* never grow */
+        }
+
+        /* One-line alert layout */
         .alert-item{
             display: grid;
             grid-template-columns: auto auto 1fr auto;
             gap: 8px;
-            align-items: start;
-            padding: 4px 0;
-            border-top: 1px dashed #1f2937;
+            align-items: center;
         }
-        .alert-item:first-child { border-top: 0; }
-        .alert-item .msg  { white-space: pre-wrap; word-break: break-word; }
+        .alert-item .msg  { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .alert-item .time { color: var(--muted); white-space: nowrap; }
-        .alert-list { max-height: 260px; overflow-y: auto; }
     </style>
 </head>
 <body>
@@ -190,8 +200,9 @@
     <section class="card alerts">
         <h2>Alerts</h2>
         <div id="activeAlerts"></div>
-        <div class="sub" style="margin-top:8px;">Recent (last 10)</div>
-        <div id="recentAlerts" class="mono alert-list" style="font-size:12px;"></div>
+
+        <div class="sub" style="margin-top:8px;">Last alert</div>
+        <div id="lastAlertRow" class="mono" style="font-size:12px;"></div>
     </section>
 
     <div class="footer muted">Powered by SmartMetrApp — polling <code class="mono">/status</code></div>
@@ -326,98 +337,94 @@
         }
 
     }
-    async function refreshAlerts() {
+
+    // ---- Last alert (single-row) ----
+    let deckAbort = null;           // to cancel in-flight requests
+    let lastDeckHTML = "";          // to avoid unnecessary reflows
+
+    async function refreshDeck() {
+        try {
+            if (deckAbort) deckAbort.abort();            // cancel older request
+            deckAbort = new AbortController();
+
+            const res = await fetch("./alerts/last?ts=" + Date.now(), { // cache-buster
+                cache: "no-store",
+                signal: deckAbort.signal
+            });
+
+            let html;
+            if (res.status === 204) {
+                html = `<div class="alert-item">
+        <span class="pill ok">all clear</span>
+        <span class="mono"></span><span class="msg"></span><span class="time"></span>
+      </div>`;
+            } else if (res.ok) {
+                const ep   = await res.json();
+                const when = new Date(ep.lastTs).toLocaleTimeString();
+                const sev  = ep.severity;
+                const type = ep.active ? "ACTIVE" : "RESOLVED";
+                const cnt  = ep.count > 1 ? ` ×${ep.count}` : "";
+
+                html = `<div class="alert-item">
+        <span class="pill sev-${sev}">${type}</span>
+        <span class="mono">[${ep.key}]</span>
+        <span class="msg">${ep.message}${cnt}</span>
+        <span class="time">${when}</span>
+      </div>`;
+            } else {
+                return; // keep previous content on HTTP error
+            }
+
+            if (html !== lastDeckHTML) {                 // only repaint if changed
+                document.getElementById("lastAlertRow").innerHTML = html;
+                lastDeckHTML = html;
+            }
+        } catch (e) {
+            if (e.name !== "AbortError") console.error("refreshDeck failed", e);
+            // keep previous content on errors
+        }
+    }
+
+    // ---- ACTIVE alerts (this area can grow, but has a min-height) ----
+    async function refreshActiveAlerts() {
         try {
             const res = await fetch("./alerts", { cache: "no-store" });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const a = await res.json();
 
             const activeDiv = document.getElementById("activeAlerts");
-            const recentDiv = document.getElementById("recentAlerts");
             activeDiv.innerHTML = "";
-            recentDiv.innerHTML = "";
 
-            // ---- ACTIVE (ongoing) ----
             if (!a || !Array.isArray(a.active) || a.active.length === 0) {
                 activeDiv.innerHTML = '<span class="pill ok">all clear</span>';
             } else {
                 a.active.forEach(x => {
-                    const age = humanAge(Date.now() - x.lastSeen);
-                    activeDiv.insertAdjacentHTML(
-                        "beforeend",
+                    const ageMs = Date.now() - x.lastSeen;
+                    const s = Math.max(1, Math.floor(ageMs / 1000));
+                    activeDiv.insertAdjacentHTML("beforeend",
                         `<div class="alert-item">
-             <span class="pill sev-${x.severity}">${x.severity}</span>
-             <span class="mono">[${x.key}]</span>
-             <span class="msg">${x.message}</span>
-             <span class="time">last seen ${age} · count ${x.count}</span>
-           </div>`
-                    );
+            <span class="pill sev-${x.severity}">${x.severity}</span>
+            <span class="mono">[${x.key}]</span>
+            <span class="msg">${x.message}</span>
+            <span class="time">last seen ${s} s · count ${x.count}</span>
+          </div>`);
                 });
             }
-
-            // ---- RECENT (dedup + newest first + limit 10) ----
-            const rec = Array.isArray(a.recent) ? a.recent.slice() : [];
-
-            // Normalize + sort by time ASC (backend may not be sorted)
-            rec.forEach(ev => {
-                // if your backend returns seconds, this converts to ms automatically
-                ev._ts = (typeof ev.ts === "number" && ev.ts < 1e12) ? ev.ts * 1000 : ev.ts;
-            });
-            rec.sort((x, y) => x._ts - y._ts);
-
-            // Collapse bursts of identical messages that occur close together
-            const GAP_MS = 5000; // 5s window -> adjust to taste
-            const buckets = [];
-            for (const ev of rec) {
-                const last = buckets[buckets.length - 1];
-                if (
-                    last &&
-                    last.key === ev.key &&
-                    last.severity === ev.severity &&
-                    last.message === ev.message &&
-                    (ev._ts - last.lastTs) <= GAP_MS
-                ) {
-                    last.lastTs = ev._ts;
-                    last.count += 1;
-                } else {
-                    buckets.push({
-                        key: ev.key,
-                        severity: ev.severity,
-                        type: ev.type,           // e.g., RAISE/CLEAR if you send it
-                        message: ev.message,
-                        firstTs: ev._ts,
-                        lastTs: ev._ts,
-                        count: 1
-                    });
-                }
-            }
-
-            // Take newest 10 collapsed items and render newest first
-            const last10 = buckets.slice(-10).reverse();
-            last10.forEach(b => {
-                const when = new Date(b.lastTs).toLocaleTimeString();
-                const countStr = b.count > 1 ? ` ×${b.count}` : "";
-                recentDiv.insertAdjacentHTML(
-                    "beforeend",
-                    `<div class="alert-item">
-           <span class="pill sev-${b.severity}">${b.type || b.severity}</span>
-           <span class="mono">[${b.key}]</span>
-           <span class="msg">${b.message}${countStr}</span>
-           <span class="time">${when}</span>
-         </div>`
-                );
-            });
         } catch (e) {
-            console.error("refreshAlerts failed", e);
+            console.error("refreshActiveAlerts failed", e);
             const activeDiv = document.getElementById("activeAlerts");
             if (activeDiv) activeDiv.innerHTML = '<span class="pill warn">alerts unavailable</span>';
         }
     }
 
-    refresh();
-    refreshAlerts();
-    setInterval(refresh, REFRESH_MS);
-    setInterval(refreshAlerts, REFRESH_MS);
+    const T = REFRESH_MS     // keep one cadence
+    refresh();                 // kick once
+    refreshDeck();
+    refreshActiveAlerts();
+
+    setInterval(refresh, T);           // <— this is the one you’re missing
+    setInterval(refreshDeck, T);
+    setInterval(refreshActiveAlerts, T);
 </script>
 </body>
 </html>
