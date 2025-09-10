@@ -15,6 +15,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 import jakarta.annotation.PostConstruct;
 
 import java.util.Arrays;
@@ -88,6 +91,14 @@ public class ModbusInverterFeeder {
 
     /** Open the Modbus-RTU slave if it's not up yet. Safe to call repeatedly. */
     private void ensureOpen() {
+        // If we think we're up but the device disappeared, close and mark down
+        if (isUp && !devicePresent()) {
+            log.warn("Serial device {} disappeared; closing inverter slave", port);
+            closeQuietly();
+            alerts.raise("INVERTER_RTU_DOWN", "USB/RS485 adapter missing: " + port, AlertService.Severity.ERROR);
+            return;
+        }
+
         if (isUp) return;
         try {
             SerialPortWrapper wrapper = new SerialPortWrapperImpl(port, baudRate);
@@ -130,7 +141,6 @@ public class ModbusInverterFeeder {
             isUp = false;
         }
         log.info("Inverter-slave closed");
-        lastWriteMs = System.currentTimeMillis();
     }
 
     // === Main output loop ===
@@ -142,9 +152,10 @@ public class ModbusInverterFeeder {
      *  - ask PowerController to prepare the outgoing Modbus words
      *  - write them into the processImage (what the inverter reads)
      */
-    private void pushOneCycle() { // work once every 10 sec
+    private void pushOneCycle() { // work once every 1 sec
         try {
-            if (!isUp || processImage == null) return;
+            // If device vanished between checks, drop out and let ensureOpen() handle it
+            if (!isUp || processImage == null || !devicePresent()) return;
 
             SmSnapshot snapshot = smReader.getLatestSnapshotSM();    // raw data from SM + timestamp of read
             double compensateKw = loadOverride.getCurrentDeltaKw();  // already smoothed/deadbanded data + grid power from SolisAPI
@@ -165,12 +176,26 @@ public class ModbusInverterFeeder {
                 for (int i = 0; i < n; i++) {
                     processImage.setInputRegister(i, outputData[i]);
                 }
-                lastWriteMs = System.currentTimeMillis();
+                lastWriteMs = System.currentTimeMillis(); // this is "last prepared frame"
             }
         } catch (Exception e) {
             alerts.raise("INVERTER_WRITE_FAIL", "Inverter-slave write failed: " + e.getMessage(), AlertService.Severity.WARN);
             // Typical causes: serial cable unplugged, device reset. We’ll re-open on the next ensureOpen().
             closeQuietly();
+        }
+    }
+
+    // helper: does the USB/serial device currently exist?
+    private boolean devicePresent() {
+        // On Linux, /dev/... is a real path. On Windows (e.g., COM11) it's not — just return true.
+        if (port == null || !port.startsWith("/")) return true;
+
+        try {
+            // Follow the by-id symlink; throws if the target doesn’t exist → returns false
+            Path real = Path.of(port).toRealPath();
+            return Files.isReadable(real); // extra sanity check
+        } catch (Exception e) {
+            return false;
         }
     }
 }
