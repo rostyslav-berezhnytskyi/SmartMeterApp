@@ -1,7 +1,7 @@
 package com.elssolution.smartmetrapp.integration.modbus;
 
-import com.elssolution.smartmetrapp.domain.SmSnapshot;
 import com.elssolution.smartmetrapp.alerts.AlertService;
+import com.elssolution.smartmetrapp.domain.SmSnapshot;
 import com.elssolution.smartmetrapp.service.LoadOverrideService;
 import com.elssolution.smartmetrapp.service.PowerControlService;
 import com.serotonin.modbus4j.BasicProcessImage;
@@ -9,6 +9,7 @@ import com.serotonin.modbus4j.ModbusFactory;
 import com.serotonin.modbus4j.ModbusSlaveSet;
 import com.serotonin.modbus4j.exception.ModbusInitException;
 import com.serotonin.modbus4j.serial.SerialPortWrapper;
+import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
@@ -17,186 +18,193 @@ import org.springframework.stereotype.Component;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-
-import jakarta.annotation.PostConstruct;
-
 import java.util.Arrays;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Exposes a Modbus-RTU *slave* on the RS-485/serial port that the inverter reads.
+ * Each second we:
+ *   1) get the latest Acrel snapshot (raw frame),
+ *   2) get the current compensation (kW) from LoadOverrideService,
+ *   3) ask PowerControlService to build the outgoing register image,
+ *   4) write the *entire* image into the slave's input registers.
+ *
+ * Acrel-only: we write native Acrel register positions (e.g. 97..102, 356..362).
+ */
 @Slf4j
 @Component
-@Getter @Setter
+@Getter
+@Setter
 public class ModbusInverterFeeder {
 
-    // === Dependencies ===
+    // ===== Dependencies =====
     private final ScheduledExecutorService scheduler;
-    private final ModbusSmReader smReader;            // reads raw data from Smart Meter
-    private final LoadOverrideService loadOverride;   // how much extra power (kW) we should compensate
-    private final PowerControlService powerControlService;    // builds the output Modbus word array for the inverter
+    private final ModbusSmReader smReader;
+    private final LoadOverrideService loadOverride;
+    private final PowerControlService powerControl;
     private final AlertService alerts;
 
     public ModbusInverterFeeder(ScheduledExecutorService scheduler,
                                 ModbusSmReader smReader,
                                 LoadOverrideService loadOverride,
-                                PowerControlService powerControlService, AlertService alerts) {
+                                PowerControlService powerControl,
+                                AlertService alerts) {
         this.scheduler = scheduler;
         this.smReader = smReader;
         this.loadOverride = loadOverride;
-        this.powerControlService = powerControlService;
+        this.powerControl = powerControl;
         this.alerts = alerts;
     }
 
-    // === Config ===
-    @Value("${serial.output.slaveId}")
-    private int slaveId;
+    // ===== Config =====
+    @Value("${serial.output.slaveId}")  private int    slaveId;
+    @Value("${serial.output.port}")     private String port;
+    @Value("${serial.output.baudRate}") private int    baudRate;
 
-    @Value("${serial.output.port}")
-    private String port;
+    /**
+     * Optional: how many input registers to pre-zero on open.
+     * Must be >= 364 for Acrel (so total power at 362 exists).
+     * You can set to 0 to skip pre-initialization.
+     */
+    @Value("${serial.output.initRegisters:400}")
+    private int initRegisters;
 
-    @Value("${serial.output.baudRate}")
-    private int baudRate;
+    // ===== Runtime state =====
+    private final Object lock = new Object();          // guards image/slave during writes & close
+    private volatile BasicProcessImage image;          // current "process image"
+    private volatile ModbusSlaveSet slave;             // serial Modbus slave
+    private volatile boolean up = false;               // opened and running
 
-    /** How many input registers we initialise/write. Increase if you expose more words. */
-    private static final int WRITE_REG_COUNT = 100;
+    private volatile short[] outputData;               // last frame we published (for UI)
+    private volatile long lastWriteMs = 0L;            // when we last wrote registers
 
-    // === Runtime state (guarded by writeLock where noted) ===
-    /** Guards concurrent access between tick() and open/close. */
-    private final Object writeLock = new Object();
-
-    /** Current “process image” (the registers the inverter will read). Null until opened. */
-    private volatile BasicProcessImage processImage;
-
-    /** The actual Modbus-RTU slave server bound to the serial port. Null until opened. */
-    private volatile ModbusSlaveSet slaveSet;
-
-    /** Simple connection flag so the open-loop doesn’t re-open unnecessarily. */
-    private volatile boolean isUp = false;
-
-    private short[] outputData;
-
-    private volatile long lastWriteMs = 0L;
-    private volatile long lastBuildMs = 0L;
-
-    // === Lifecycle ===
+    // ===== Lifecycle =====
     @PostConstruct
-    public void start() {
-        // Try to (re)open the serial slave every 5s if it’s down
+    void start() {
+        // Re-open watcher
         scheduler.scheduleWithFixedDelay(this::ensureOpen, 0, 5, TimeUnit.SECONDS);
-        // Push data to the inverter once per second
-        scheduler.scheduleAtFixedRate(this::pushOneCycle, 1, 1, TimeUnit.SECONDS);
+        // Data push loop
+        scheduler.scheduleAtFixedRate(this::tick, 1, 1, TimeUnit.SECONDS);
     }
 
-    // === Open/Close ===
+    // ===== Open/Close =====
 
-    /** Open the Modbus-RTU slave if it's not up yet. Safe to call repeatedly. */
+    /** Ensure the Modbus slave is up; if device vanishes, close and mark down. */
     private void ensureOpen() {
-        // If we think we're up but the device disappeared, close and mark down
-        if (isUp && !devicePresent()) {
+        if (up && !devicePresent()) {
             log.warn("Serial device {} disappeared; closing inverter slave", port);
             closeQuietly();
             alerts.raise("INVERTER_RTU_DOWN", "USB/RS485 adapter missing: " + port, AlertService.Severity.ERROR);
             return;
         }
+        if (up) return;
 
-        if (isUp) return;
         try {
             SerialPortWrapper wrapper = new SerialPortWrapperImpl(port, baudRate);
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
             BasicProcessImage newImage = new BasicProcessImage(slaveId);
 
-            // Pre-zero a reasonable range of input registers so reader sees clean data
-            for (int i = 0; i < WRITE_REG_COUNT; i++) {
-                newImage.setInputRegister(i, (short) 0);
+            // Pre-zero a safe range (optional but nice to avoid null/garbage reads on boot).
+            if (initRegisters > 0) {
+                for (int i = 0; i < initRegisters; i++) {
+                    newImage.setInputRegister(i, (short) 0);
+                }
             }
 
             newSlave.addProcessImage(newImage);
             newSlave.start();
 
-            synchronized (writeLock) {
-                slaveSet     = newSlave;
-                processImage = newImage;
-                isUp         = true;
+            synchronized (lock) {
+                slave = newSlave;
+                image = newImage;
+                up = true;
             }
-            log.info("Inverter-slave opened: port={} baud={} registersInit={}",
-                    port, baudRate, WRITE_REG_COUNT);
+            log.info("Inverter-slave opened: port={} baud={} initRegisters={}", port, baudRate, initRegisters);
             alerts.resolve("INVERTER_RTU_DOWN");
         } catch (ModbusInitException e) {
-            alerts.raise("INVERTER_RTU_DOWN", "Inverter-slave open failed (ModbusInit): " + e.getMessage(), AlertService.Severity.ERROR);
+            alerts.raise("INVERTER_RTU_DOWN",
+                    "Inverter-slave open failed (ModbusInit): " + e.getMessage(),
+                    AlertService.Severity.ERROR);
         } catch (Exception e) {
-            alerts.raise("INVERTER_RTU_DOWN", "Inverter-slave open failed (unexpected): " + e.getMessage(), AlertService.Severity.ERROR);
+            alerts.raise("INVERTER_RTU_DOWN",
+                    "Inverter-slave open failed (unexpected): " + e.getMessage(),
+                    AlertService.Severity.ERROR);
         }
     }
 
-    /** Close the slave quietly and mark “down”. Used on write errors or USB unplug. */
+    /** Stop the slave and clear internal state. Safe to call multiple times. */
     private void closeQuietly() {
-        synchronized (writeLock) {
-            try {
-                if (slaveSet != null) slaveSet.stop();
-            } catch (Exception ignore) {
-                // swallow—best effort
+        synchronized (lock) {
+            try { if (slave != null) slave.stop(); }
+            catch (Exception ignore) { /* best-effort */ }
+            finally {
+                slave = null;
+                image = null;
+                up = false;
             }
-            slaveSet = null;
-            processImage = null;
-            isUp = false;
         }
         log.info("Inverter-slave closed");
     }
 
-    // === Main output loop ===
+    // ===== Main loop =====
 
-    /**
-     * One I/O cycle:
-     *  - get the latest Smart Meter snapshot (immutable)
-     *  - get the current grid-import compensation (kW) from Solis
-     *  - ask PowerController to prepare the outgoing Modbus words
-     *  - write them into the processImage (what the inverter reads)
-     */
-    private void pushOneCycle() { // work once every 1 sec
+    /** Build one frame and publish it to the Modbus slave. */
+    private void tick() {
         try {
-            // If device vanished between checks, drop out and let ensureOpen() handle it
-            if (!isUp || processImage == null || !devicePresent()) return;
+            if (!up || image == null || !devicePresent()) return;
 
-            SmSnapshot snapshot = smReader.getLatestSnapshotSM();    // raw data from SM + timestamp of read
-            double compensateKw = loadOverride.getCurrentDeltaKw();  // already smoothed/deadbanded data + grid power from SolisAPI
+            // 1) Meter snapshot (raw Acrel registers)
+            SmSnapshot snap = smReader.getLatestSnapshotSM();
 
-            short[] outputData = powerControlService.prepareOutputWords(snapshot, compensateKw);
-            setOutputData(outputData);
+            // 2) Desired compensation (kW), already honoring overrideEnabled flag
+            double deltaKw = loadOverride.getCurrentDeltaKw();
 
-            lastBuildMs = System.currentTimeMillis();
-            if (log.isDebugEnabled()) {
-                log.debug("SM snapshot data: {}", Arrays.toString(snapshot.data));
-                log.debug("Grid import to compensate (kW): {}", compensateKw);
-                log.debug("Output data to inverter: {}", Arrays.toString(outputData));
-            }
+            // 3) Build outgoing register image (Acrel-only)
+            short[] frame = powerControl.prepareOutputWords(snap, deltaKw);
 
-            synchronized (writeLock) {
-                if (processImage == null) return; // might have been closed while we built the frame
-                int n = Math.min(outputData.length, WRITE_REG_COUNT);
-                for (int i = 0; i < n; i++) {
-                    processImage.setInputRegister(i, outputData[i]);
+            // 4) Publish: write the ENTIRE frame so high registers (e.g., 356..362) are set
+            synchronized (lock) {
+                if (image == null) return; // could be closed concurrently
+                for (int i = 0; i < frame.length; i++) {
+                    image.setInputRegister(i, frame[i]);
                 }
-                lastWriteMs = System.currentTimeMillis(); // this is "last prepared frame"
+                lastWriteMs = System.currentTimeMillis();
             }
+
+            // expose for UI
+            outputData = frame;
+
+            if (log.isDebugEnabled()) {
+                log.debug("Compensate={} kW; wrote {} regs (min..max={}..{})",
+                        deltaKw, frame.length, 0, frame.length - 1);
+                if (log.isTraceEnabled()) {
+                    log.trace("SM snapshot: {}", Arrays.toString(snap.data));
+                    log.trace("Output frame: {}", Arrays.toString(frame));
+                }
+            }
+
         } catch (Exception e) {
-            alerts.raise("INVERTER_WRITE_FAIL", "Inverter-slave write failed: " + e.getMessage(), AlertService.Severity.WARN);
-            // Typical causes: serial cable unplugged, device reset. We’ll re-open on the next ensureOpen().
+            alerts.raise("INVERTER_WRITE_FAIL",
+                    "Inverter-slave write failed: " + e.getMessage(),
+                    AlertService.Severity.WARN);
+            // Most common: unplug/reset; the opener will retry.
             closeQuietly();
         }
     }
 
-    // helper: does the USB/serial device currently exist?
-    private boolean devicePresent() {
-        // On Linux, /dev/... is a real path. On Windows (e.g., COM11) it's not — just return true.
-        if (port == null || !port.startsWith("/")) return true;
+    // ===== Helpers =====
 
+    /**
+     * On Linux we can check /dev/... existence. On Windows (COMx) just return true.
+     */
+    private boolean devicePresent() {
+        if (port == null || !port.startsWith("/")) return true;
         try {
-            // Follow the by-id symlink; throws if the target doesn’t exist → returns false
-            Path real = Path.of(port).toRealPath();
-            return Files.isReadable(real); // extra sanity check
+            Path real = Path.of(port).toRealPath();  // follow by-id symlink if present
+            return Files.isReadable(real);
         } catch (Exception e) {
             return false;
         }
     }
 }
-

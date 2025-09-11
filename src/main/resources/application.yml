@@ -3,9 +3,7 @@ serial:
     port: ${SERIAL_INPUT_PORT:COM7}
     baudRate: ${SERIAL_INPUT_BAUD:9600}
     slaveId: ${SERIAL_INPUT_SLAVE:1}
-    startOffset: ${SERIAL_INPUT_OFFSET:0}
     pollInterval: ${SERIAL_INPUT_POLL:1000}
-    numberOfRegisters: ${SERIAL_INPUT_REGS:72}
     # delay before first attempt (ms) — helps after hard restarts on Windows
     initialOpenDelayMs: ${SERIAL_INITIAL_OPEN_DELAY_MS:2000}
     # extra backoff after a failed read/open (ms)
@@ -17,8 +15,8 @@ serial:
     port: ${SERIAL_OUTPUT_PORT:COM11}
     baudRate: ${SERIAL_OUTPUT_BAUD:9600}
     slaveId: ${SERIAL_OUTPUT_SLAVE:1}
-    startOffset: ${SERIAL_OUTPUT_OFFSET:0}
     pollInterval: ${SERIAL_OUTPUT_POLL:1000}
+    initRegisters: ${SERIAL_OUTPUT_INIT_REGS:400}
 
 devtools:
   restart:
@@ -51,7 +49,6 @@ logging:
         smartmetrapp: ${SMARTMETER_LOG_LEVEL:INFO}
 
 smartmetr:
-  kind: ${SMARTMETR_KIND:acrel}      # 'eastron' (current behavior) or 'acrel'
   cosPhiMin: ${SMARTMETR_COSPHI_MIN:0.85}
   smoothingWindow: ${SMARTMETR_SMOOTHING_WINDOW:5}
   deltaMaxKwPerSec: ${SMARTMETR_DELTA_MAX_KW_PER_SEC:2}
@@ -60,11 +57,10 @@ smartmetr:
     maxKw: ${SMARTMETR_CLAMP_MAX_KW:50}
   staleToZeroMs: ${SMARTMETR_STALE_TO_ZERO_MS:300000}
   rampDownMs: ${SMARTMETR_RAMP_DOWN_MS:2000}
-  floatOrder: ${SMARTMETR_FLOAT_ORDER:BE}
-  fHz: ${SMARTMETR_FHZ:-1}
+
   scale:
     pt: ${SMARTMETR_ACREL_PT:1.0}
-    ct: ${SMARTMETR_ACREL_CT:1.0}
+    ct: ${SMARTMETR_ACREL_CT:30.0}
 
 management:
   endpoints:
@@ -84,19 +80,6 @@ management:
       enabled: true
     git:
       mode: full
-
-meterMap:
-  vL1:    ${METERMAP_VL1:0}
-  iL1:    ${METERMAP_IL1:6}
-  pTotal: ${METERMAP_PTOTAL:52}
-  vL2:    ${METERMAP_VL2:2}
-  vL3:    ${METERMAP_VL3:4}
-  iL2:    ${METERMAP_IL2:8}
-  iL3:    ${METERMAP_IL3:10}
-  pL1:    ${METERMAP_PL1:12}
-  pL2:    ${METERMAP_PL2:14}
-  pL3:    ${METERMAP_PL3:16}
-
 
 alert:
   telegram:
