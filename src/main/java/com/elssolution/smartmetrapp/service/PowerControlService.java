@@ -11,184 +11,226 @@ import static com.elssolution.smartmetrapp.domain.Maths.clamp;
 import static com.elssolution.smartmetrapp.domain.Maths.safeDiv;
 
 /**
- * Builds the Modbus output words for the inverter:
- * - if the smart-meter data is too old -> drive currents & powers to 0 (keep voltages)
- * - if fresh -> add compensated power evenly across 3 phases (adjust currents; bump total power)
+ * Builds the *outgoing* Modbus image for the inverter.
  *
- * Notes:
- * - We assume a 3-phase layout by default.
- * - All calculations use IEEE754 floats on the wire (handled by MeterCodec).
+ *  - acrel:  work on RAW Acrel registers (u16 + i32 at fixed addresses).
+ *  - eastron:work on float words per MeterRegisterMap (your legacy layout).
  */
 @Slf4j
 @Component
 public class PowerControlService {
 
     private final MeterDecoder codec;
-    private final MeterRegisterMap registerMap;
+    private final MeterRegisterMap map;
 
-    public PowerControlService(MeterDecoder codec, MeterRegisterMap registerMap) {
+    public PowerControlService(MeterDecoder codec, MeterRegisterMap map) {
         this.codec = codec;
-        this.registerMap = registerMap;
+        this.map   = map;
     }
 
-    @Value("${smartmetr.maxDataAgeMs:300000}") // 5 minutes default
-    private long maxDataAgeMs;
+    // Mode & scaling
+    @Value("${smartmetr.kind:acrel}") private String meterKind;
+    @Value("${smartmetr.scale.pt:1.0}") private double acrelPt;
+    @Value("${smartmetr.scale.ct:1.0}") private double acrelCt;
 
-    @Value("${smartmetr.rampToZeroMs:2000}")
-    private long rampToZeroMs;
+    // Generic knobs
+    @Value("${smartmetr.maxDataAgeMs:300000}") private long maxDataAgeMs;
+    @Value("${smartmetr.rampToZeroMs:2000}")   private long rampToZeroMs;
+    @Value("${smartmetr.minPowerFactor:0.95}") private double minPowerFactor;
 
-    /** Minimum power factor to use when converting kW→A. Clamped to [0.1, 1.0]. */
-    @Value("${smartmetr.minPowerFactor:0.95}")
-    private double minPowerFactor;
+    // Acrel addresses we use
+    private static final int ACREL_V1 = 97, ACREL_V2 = 98, ACREL_V3 = 99;     // u16 *0.1V*PT
+    private static final int ACREL_I1 = 100, ACREL_I2 = 101, ACREL_I3 = 102;  // u16 *0.01A*CT
+    private static final int ACREL_HZ = 119;                                   // u16 *0.01Hz
+    private static final int ACREL_P1 = 356, ACREL_P2 = 358, ACREL_P3 = 360, ACREL_PTOT = 362; // i32 (see below)
 
-    /**
-     * Build the words to publish to the inverter.
-     * @param snapshot last good meter read (raw words + timestamp)
-     * @param compensateKw how many kW we want to absorb (>= 0)
-     */
+    /** Build output words. */
     public short[] prepareOutputWords(SmSnapshot snapshot, double compensateKw) {
-        // Allocate from snapshot if available, otherwise a sensible default write window
-        final int len = (snapshot != null && snapshot.data != null)
-                ? snapshot.data.length : 100; // matches WRITE_REG_COUNT in feeder
-        short[] outWords = (snapshot != null && snapshot.data != null)
-                ? snapshot.data.clone()
-                : new short[len];
-
-        if (!isRecent(snapshot, maxDataAgeMs) || isOffline(outWords)) {
-            long age = (snapshot == null) ? -1L : (System.currentTimeMillis() - snapshot.updatedAtMs);
-            log.info("meter_data_stale ageMs={} → driving currents & powers to 0", age);
-            driveToNeutral(outWords);
-            return outWords;
+        if ("acrel".equalsIgnoreCase(meterKind)) {
+            return buildAcrelOutput(snapshot, compensateKw);
+        } else {
+            return buildEastronOutput(snapshot, compensateKw);
         }
-
-        // Defensive clamp
-        if (Double.isNaN(compensateKw) || compensateKw < 0.0) compensateKw = 0.0;
-
-        if (compensateKw > 0.0) {
-            applyCompensationThreePhase(outWords, compensateKw);
-        }
-        return outWords;
     }
+
+    // ---------------- ACREL PATH (raw) ----------------
+
+    private short[] buildAcrelOutput(SmSnapshot s, double compensateKw) {
+        final int len = (s != null && s.data != null) ? s.data.length : 400;
+        short[] out = (s != null && s.data != null) ? s.data.clone() : new short[len];
+
+        if (!isRecent(s, maxDataAgeMs) || acrelOffline(out)) {
+            // zero I & P; keep voltages so inverter can tell offline vs dead
+            writeU16(out, ACREL_I1, 0);
+            writeU16(out, ACREL_I2, 0);
+            writeU16(out, ACREL_I3, 0);
+            writeI32BE(out, ACREL_P1, 0);
+            writeI32BE(out, ACREL_P2, 0);
+            writeI32BE(out, ACREL_P3, 0);
+            writeI32BE(out, ACREL_PTOT, 0);
+            return out;
+        }
+
+        if (Double.isNaN(compensateKw) || compensateKw < 0) compensateKw = 0.0;
+        if (compensateKw == 0.0) return out; // pure pass-through
+
+        final double pf = clamp(minPowerFactor, 0.1, 1.0);
+        final double perPhaseW = (compensateKw * 1000.0) / 3.0; // W per phase to add
+
+        // Read present V/I/P (decoded)
+        double v1 = 0.1 * u16(out, ACREL_V1) * acrelPt;
+        double v2 = 0.1 * u16(out, ACREL_V2) * acrelPt;
+        double v3 = 0.1 * u16(out, ACREL_V3) * acrelPt;
+
+        double i1 = 0.01 * u16(out, ACREL_I1) * acrelCt;
+        double i2 = 0.01 * u16(out, ACREL_I2) * acrelCt;
+        double i3 = 0.01 * u16(out, ACREL_I3) * acrelCt;
+
+        // Powers in W: NOTE decode: pW = raw * PT * CT  (because spec said i32*0.001 kW *1000 = raw * PT * CT)
+        double p1W = (double) i32be(out, ACREL_P1)  * acrelPt * acrelCt;
+        double p2W = (double) i32be(out, ACREL_P2)  * acrelPt * acrelCt;
+        double p3W = (double) i32be(out, ACREL_P3)  * acrelPt * acrelCt;
+        double ptW = (double) i32be(out, ACREL_PTOT) * acrelPt * acrelCt;
+
+        // Add currents coherently: ΔI = ΔW / (V * pf)
+        double addI1 = safeDiv(perPhaseW, Math.max(100.0, v1 * pf));
+        double addI2 = safeDiv(perPhaseW, Math.max(100.0, v2 * pf));
+        double addI3 = safeDiv(perPhaseW, Math.max(100.0, v3 * pf));
+        i1 += addI1; i2 += addI2; i3 += addI3;
+
+        // Write back currents → raw u16 where Ia = 0.01 * raw * CT  => raw = Ia * 100 / CT
+        writeU16(out, ACREL_I1, clampU16(Math.round(i1 * 100.0 / Math.max(1e-9, acrelCt))));
+        writeU16(out, ACREL_I2, clampU16(Math.round(i2 * 100.0 / Math.max(1e-9, acrelCt))));
+        writeU16(out, ACREL_I3, clampU16(Math.round(i3 * 100.0 / Math.max(1e-9, acrelCt))));
+
+        // Bump per-phase powers in W
+        p1W += perPhaseW; p2W += perPhaseW; p3W += perPhaseW; ptW += (compensateKw * 1000.0);
+
+        // Convert W back to raw i32: raw = pW / (PT * CT)
+        writeI32BE(out, ACREL_P1,  clampI32(Math.round(p1W / Math.max(1e-9, acrelPt * acrelCt))));
+        writeI32BE(out, ACREL_P2,  clampI32(Math.round(p2W / Math.max(1e-9, acrelPt * acrelCt))));
+        writeI32BE(out, ACREL_P3,  clampI32(Math.round(p3W / Math.max(1e-9, acrelPt * acrelCt))));
+        writeI32BE(out, ACREL_PTOT,clampI32(Math.round(ptW / Math.max(1e-9, acrelPt * acrelCt))));
+
+        log.debug("acrel_comp Δ={}kW → +{}W/phase; pf={} → ΔI≈[{},{},{}]A",
+                compensateKw, Math.round(perPhaseW), pf,
+                String.format("%.2f",addI1), String.format("%.2f",addI2), String.format("%.2f",addI3));
+
+        return out;
+    }
+
+    private boolean acrelOffline(short[] w) {
+        // consider offline if all three voltages <1V after scaling
+        double v1 = 0.1 * u16(w, ACREL_V1) * acrelPt;
+        double v2 = 0.1 * u16(w, ACREL_V2) * acrelPt;
+        double v3 = 0.1 * u16(w, ACREL_V3) * acrelPt;
+        return (v1 < 1.0 && v2 < 1.0 && v3 < 1.0);
+    }
+
+    // ---------------- EASTRON PATH (float image) ----------------
+
+    private short[] buildEastronOutput(SmSnapshot s, double compensateKw) {
+        // Keep your previous behavior verbatim
+        final int len = (s != null && s.data != null) ? s.data.length : 124;
+        short[] out = (s != null && s.data != null) ? s.data.clone() : new short[len];
+
+        if (!isRecent(s, maxDataAgeMs) || eastronOffline(out)) {
+            float zero = 0f;
+            writeFloatIfPresent(out, map.pTotal(), zero);
+            writeFloatIfPresent(out, map.pL1(), zero);
+            writeFloatIfPresent(out, map.pL2(), zero);
+            writeFloatIfPresent(out, map.pL3(), zero);
+            writeFloatIfPresent(out, map.iL1(), zero);
+            writeFloatIfPresent(out, map.iL2(), zero);
+            writeFloatIfPresent(out, map.iL3(), zero);
+            return out;
+        }
+
+        if (Double.isNaN(compensateKw) || compensateKw < 0) compensateKw = 0.0;
+        if (compensateKw == 0.0) return out;
+
+        final double pf = clamp(minPowerFactor, 0.1, 1.0);
+        final double perPhaseKw = compensateKw / 3.0;
+
+        double v1 = readFloat(out, map.vL1());
+        double v2 = readFloat(out, map.vL2());
+        double v3 = readFloat(out, map.vL3());
+        double i1 = readFloat(out, map.iL1());
+        double i2 = readFloat(out, map.iL2());
+        double i3 = readFloat(out, map.iL3());
+
+        double addI1 = safeDiv((perPhaseKw * 1000.0), Math.max(100.0, v1 * pf));
+        double addI2 = safeDiv((perPhaseKw * 1000.0), Math.max(100.0, v2 * pf));
+        double addI3 = safeDiv((perPhaseKw * 1000.0), Math.max(100.0, v3 * pf));
+
+        writeFloatIfPresent(out, map.iL1(), (float) (i1 + addI1));
+        writeFloatIfPresent(out, map.iL2(), (float) (i2 + addI2));
+        writeFloatIfPresent(out, map.iL3(), (float) (i3 + addI3));
+
+        float addW = (float) (perPhaseKw * 1000.0);
+        bumpFloat(out, map.pL1(), addW);
+        bumpFloat(out, map.pL2(), addW);
+        bumpFloat(out, map.pL3(), addW);
+        bumpFloat(out, map.pTotal(), (float) (compensateKw * 1000.0));
+
+        return out;
+    }
+
+    private boolean eastronOffline(short[] w) {
+        double v1 = readFloat(w, map.vL1());
+        double v2 = readFloat(w, map.vL2());
+        double v3 = readFloat(w, map.vL3());
+        return (v1 < 1.0 && v2 < 1.0 && v3 < 1.0);
+    }
+
+    // ---------------- Utilities ----------------
 
     private boolean isRecent(SmSnapshot s, long maxAgeMs) {
-        if (s == null || s.updatedAtMs <= 0) return false;
-        return (System.currentTimeMillis() - s.updatedAtMs) <= maxAgeMs;
+        return (s != null && s.updatedAtMs > 0 && (System.currentTimeMillis() - s.updatedAtMs) <= maxAgeMs);
     }
 
-    /** Zero active power(s) & current(s); keep voltages (0 V can be treated as a fault). */
-    private void driveToNeutral(short[] words) {
-        float pTot = readSafe(words, registerMap.pTotal());
-        float i1   = readSafe(words, registerMap.iL1());
-        float i2   = readSafe(words, registerMap.iL2());
-        float i3   = readSafe(words, registerMap.iL3());
-
-        final float pTarget = 0f, iTarget = 0f;
-        if (rampToZeroMs > 0) {
-            pTot = rampTowards(pTot, pTarget, rampToZeroMs);
-            i1   = rampTowards(i1,   iTarget, rampToZeroMs);
-            i2   = rampTowards(i2,   iTarget, rampToZeroMs);
-            i3   = rampTowards(i3,   iTarget, rampToZeroMs);
-        } else {
-            pTot = pTarget; i1 = iTarget; i2 = iTarget; i3 = iTarget;
-        }
-
-        writeIfPresent(words, registerMap.pTotal(), pTot);
-        writeIfPresent(words, registerMap.iL1(),   i1);
-        writeIfPresent(words, registerMap.iL2(),   i2);
-        writeIfPresent(words, registerMap.iL3(),   i3);
-
-        writeIfPresent(words, registerMap.pL1(), 0f);
-        writeIfPresent(words, registerMap.pL2(), 0f);
-        writeIfPresent(words, registerMap.pL3(), 0f);
+    // Acrel raw helpers
+    private static int u16(short[] a, int idx) {
+        if (a == null || idx < 0 || idx >= a.length) return 0;
+        return a[idx] & 0xFFFF;
+    }
+    private static void writeU16(short[] a, int idx, int u) {
+        if (a == null || idx < 0 || idx >= a.length) return;
+        a[idx] = (short) (u & 0xFFFF);
+    }
+    private static int i32be(short[] a, int mswIdx) {
+        int hi = u16(a, mswIdx);
+        int lo = u16(a, mswIdx + 1);
+        return (hi << 16) | lo;
+    }
+    private static void writeI32BE(short[] a, int mswIdx, int val) {
+        if (a == null || mswIdx < 0 || mswIdx + 1 >= a.length) return;
+        a[mswIdx]     = (short) ((val >>> 16) & 0xFFFF);
+        a[mswIdx + 1] = (short) (val & 0xFFFF);
+    }
+    private static int clampU16(long v) {
+        return (int) Math.max(0, Math.min(0xFFFFL, v));
+    }
+    private static int clampI32(long v) {
+        long min = 0x80000000L; // signed
+        long max = 0x7FFFFFFFL;
+        if (v < min) v = min;
+        if (v > max) v = max;
+        return (int) v;
     }
 
-    /**
-     * Split compensateKw evenly across 3 phases and adjust currents.
-     * Bump total active power by (compensateKw * 1000).
-     */
-    private void applyCompensationThreePhase(short[] words, double compensateKw) {
-        final double pf = clamp(minPowerFactor, 0.1, 1.0);
-        final double perPhaseKw = safeDiv(compensateKw, 3.0);
-
-        // L1
-        double v1 = readSafe(words, registerMap.vL1());
-        double i1 = readSafe(words, registerMap.iL1());
-        double addI1 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v1 * pf)));
-        i1 += addI1;
-        writeIfPresent(words, registerMap.iL1(), (float) i1);
-
-        // L2 (if mapped)
-        if (hasRegister(registerMap.vL2()) && hasRegister(registerMap.iL2())) {
-            double v2 = readSafe(words, registerMap.vL2());
-            double i2 = readSafe(words, registerMap.iL2());
-            double addI2 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v2 * pf)));
-            i2 += addI2;
-            writeIfPresent(words, registerMap.iL2(), (float) i2);
-        }
-
-        // L3 (if mapped)
-        if (hasRegister(registerMap.vL3()) && hasRegister(registerMap.iL3())) {
-            double v3 = readSafe(words, registerMap.vL3());
-            double i3 = readSafe(words, registerMap.iL3());
-            double addI3 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v3 * pf)));
-            i3 += addI3;
-            writeIfPresent(words, registerMap.iL3(), (float) i3);
-        }
-
-        // bump total active power (W)
-        double pTot = readSafe(words, registerMap.pTotal());
-        pTot += (compensateKw * 1000.0);
-        writeIfPresent(words, registerMap.pTotal(), (float) pTot);
-
-        // optionally bump per-phase power (if mapped)
-        bumpPerPhasePower(words, (float) perPhaseKw);
-
-        log.debug("compensation_applied totalAddKw={} perPhaseKw={} pf={}", compensateKw, perPhaseKw, pf);
+    // Float helpers (Eastron)
+    private double readFloat(short[] w, int off) {
+        if (off < 0 || w == null || off + 1 >= w.length) return 0.0;
+        return codec.readFloatOrDefault(w, off, 0f);
     }
-
-    private void bumpPerPhasePower(short[] words, float perPhaseKw) {
-        float addW = perPhaseKw * 1000f;
-        if (hasRegister(registerMap.pL1())) writeIfPresent(words, registerMap.pL1(), readSafe(words, registerMap.pL1()) + addW);
-        if (hasRegister(registerMap.pL2())) writeIfPresent(words, registerMap.pL2(), readSafe(words, registerMap.pL2()) + addW);
-        if (hasRegister(registerMap.pL3())) writeIfPresent(words, registerMap.pL3(), readSafe(words, registerMap.pL3()) + addW);
+    private void writeFloatIfPresent(short[] w, int off, float val) {
+        if (off < 0 || w == null || off + 1 >= w.length) return;
+        codec.writeFloat(w, off, val);
     }
-
-    /** Safe float read via codec; returns 0 if the register is missing or out of range. */
-    private float readSafe(short[] words, int wordOffset) {
-        if (!hasRegister(wordOffset)) return 0f;
-        return codec.readFloatOrDefault(words, wordOffset, 0f);
-    }
-
-    /** Safe float write: no-op if the register is missing or out of range. */
-    private void writeIfPresent(short[] words, int wordOffset, float value) {
-        if (!hasRegister(wordOffset)) return;
-        int last = wordOffset + 1;
-        if (last >= words.length) return;
-        codec.writeFloat(words, wordOffset, value);
-    }
-
-    /** Treat negative offsets (e.g., -1) as “not mapped”. */
-    private boolean hasRegister(int wordOffset) {
-        return wordOffset >= 0;
-    }
-
-    /**
-     * Linear ramp towards target over rampMs.
-     * Assumes caller is invoked roughly once per second.
-     */
-    private float rampTowards(float current, float target, long rampMs) {
-        if (rampMs <= 0) return target;
-        float perSec = 1.0f / Math.max(1f, (rampMs / 1000f));
-        float delta = target - current;
-        float step = Math.abs(delta) * perSec;
-        return current + Math.copySign(Math.min(Math.abs(delta), step), delta);
-    }
-
-    /** Treat meter offline/zero-volt as stale and command zeros */
-    private boolean isOffline(short[] words) {
-        double v1 = readSafe(words, registerMap.vL1());
-        double v2 = hasRegister(registerMap.vL2()) ? readSafe(words, registerMap.vL2()) : v1;
-        double v3 = hasRegister(registerMap.vL3()) ? readSafe(words, registerMap.vL3()) : v1;
-        return (v1 < 1.0 && v2 < 1.0 && v3 < 1.0);
+    private void bumpFloat(short[] w, int off, float add) {
+        if (off < 0 || w == null || off + 1 >= w.length) return;
+        float cur = codec.readFloatOrDefault(w, off, 0f);
+        codec.writeFloat(w, off, cur + add);
     }
 }

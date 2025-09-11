@@ -1,6 +1,6 @@
 serial:
   input:
-    port: ${SERIAL_INPUT_PORT:COM7}
+    port: ${SERIAL_INPUT_PORT:COM6}
     baudRate: ${SERIAL_INPUT_BAUD:9600}
     slaveId: ${SERIAL_INPUT_SLAVE:1}
     startOffset: ${SERIAL_INPUT_OFFSET:0}
@@ -14,7 +14,7 @@ serial:
     timeoutsBeforeReopen: ${SERIAL_TIMEOUTS_BEFORE_REOPEN:3}
 
   output:
-    port: ${SERIAL_OUTPUT_PORT:COM11}
+    port: ${SERIAL_OUTPUT_PORT:COM5}
     baudRate: ${SERIAL_OUTPUT_BAUD:9600}
     slaveId: ${SERIAL_OUTPUT_SLAVE:1}
     startOffset: ${SERIAL_OUTPUT_OFFSET:0}
