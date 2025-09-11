@@ -21,6 +21,8 @@ public class MeterRegisterMap {
     @Value("${meterMap.pL2:14}")    private int pL2;
     @Value("${meterMap.pL3:16}")    private int pL3;
 
+    @Value("${smartmetr.fHz:-1}") private int fHz;  // (optional)
+
     // Accessors with the short, readable names PowerController expects
     public int vL1()    { return vL1; }
     public int vL2()    { return vL2; }
@@ -32,4 +34,5 @@ public class MeterRegisterMap {
     public int pL1()    { return pL1; }
     public int pL2()    { return pL2; }
     public int pL3()    { return pL3; }
+    public int fHz() { return fHz; }
 }

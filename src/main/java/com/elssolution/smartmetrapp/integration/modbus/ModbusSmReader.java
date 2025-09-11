@@ -5,6 +5,8 @@ import com.elssolution.smartmetrapp.alerts.AlertService;
 import com.serotonin.modbus4j.ModbusFactory;
 import com.serotonin.modbus4j.ModbusMaster;
 import com.serotonin.modbus4j.exception.ModbusTransportException;
+import com.serotonin.modbus4j.msg.ReadHoldingRegistersRequest;
+import com.serotonin.modbus4j.msg.ReadHoldingRegistersResponse;
 import com.serotonin.modbus4j.msg.ReadInputRegistersRequest;
 import com.serotonin.modbus4j.msg.ReadInputRegistersResponse;
 import com.serotonin.modbus4j.serial.SerialPortWrapper;
@@ -25,6 +27,9 @@ import com.fazecast.jSerialComm.SerialPortTimeoutException; // jSerialComm timeo
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ScheduledFuture;
+
+import com.elssolution.smartmetrapp.domain.MeterDecoder;      // NEW
+import com.elssolution.smartmetrapp.domain.MeterRegisterMap; // NEW
 
 
 /**
@@ -54,6 +59,21 @@ public class ModbusSmReader {
     @Value("${serial.input.timeoutsBeforeReopen:3}")
     private int timeoutsBeforeReopen; // only after this many consecutive timeouts do we reopen
 
+    //  Acrel
+    // ModbusSmReader.java  (fields – add)
+    @Value("${smartmetr.kind:eastron}")
+    private String meterKind;                  // 'eastron' or 'acrel'
+
+    @Value("${smartmetr.scale.pt:1.0}")
+    private double acrelPt;
+
+    @Value("${smartmetr.scale.ct:1.0}")
+    private double acrelCt;
+
+    // needed to build an Eastron-like float image from Acrel ints
+    private final MeterDecoder codec;          // NEW
+    private final MeterRegisterMap map;        // NEW
+
     // ==== Last-good snapshot (visible to other threads) ====
     private volatile SmSnapshot latestSnapshotSM = new SmSnapshot(new short[72], 0L);
 
@@ -76,7 +96,9 @@ public class ModbusSmReader {
     private volatile long lastOpenAt = 0L;     // when we last opened the port successfully
     private volatile int consecutiveTimeouts = 0;
 
-    public ModbusSmReader(ScheduledExecutorService scheduler, AlertService alerts) {
+    public ModbusSmReader(MeterDecoder codec, MeterRegisterMap map, ScheduledExecutorService scheduler, AlertService alerts) {
+        this.codec = codec;
+        this.map = map;
         this.scheduler = scheduler;
         this.alerts = alerts;
     }
@@ -106,6 +128,27 @@ public class ModbusSmReader {
     private void readOnceSafe() {
         try {
             ensureOpen();
+
+            if ("acrel".equalsIgnoreCase(meterKind)) {
+                // --- ACREL path: read holding registers (03) in two small blocks ---
+                ReadHoldingRegistersResponse rVI =
+                        (ReadHoldingRegistersResponse) master.send(
+                                new ReadHoldingRegistersRequest(slaveId, 97, 26));   // 97..122
+                if (rVI.isException()) throw new RuntimeException("Acrel block1 ex: " + rVI.getExceptionMessage());
+
+                ReadHoldingRegistersResponse rP =
+                        (ReadHoldingRegistersResponse) master.send(
+                                new ReadHoldingRegistersRequest(slaveId, 356, 8));   // 356..363 (incl. 362 total P)
+                if (rP.isException()) throw new RuntimeException("Acrel block2 ex: " + rP.getExceptionMessage());
+
+                short[] words = buildEastronLikeImageFromAcrel(rVI.getShortData(), rP.getShortData());
+                latestSnapshotSM = new SmSnapshot(words, System.currentTimeMillis());
+                consecutiveTimeouts = 0;
+                alerts.resolve("METER_DISCONNECTED");
+                alerts.resolve("MODBUS_UNCAUGHT");
+                if (log.isDebugEnabled()) log.debug("acrel_read_ok (97..122,356..362) -> imageLen={}", words.length);
+                return;
+            }
 
             ReadInputRegistersRequest req =
                     new ReadInputRegistersRequest(slaveId, startOffset, numberOfRegisters);
@@ -175,6 +218,7 @@ public class ModbusSmReader {
             sleepQuiet(reopenBackoffMs);
         }
     }
+
 
     private boolean isTimeout(Throwable e) {
         // unwrap causes to see if it is a known timeout type
@@ -247,5 +291,56 @@ public class ModbusSmReader {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private short[] buildEastronLikeImageFromAcrel(short[] blk97, short[] blk356) {
+        // We'll publish an image compatible with your existing map (floats at offsets)
+        short[] out = new short[Math.max(100, map.pTotal() + 2)]; // safe size
+
+        // --- A) Voltages (u16 * 0.1 V) ---
+        float v1 = 0.1f * u16(blk97, 0);   // addr 97
+        float v2 = 0.1f * u16(blk97, 1);   // 98
+        float v3 = 0.1f * u16(blk97, 2);   // 99
+        codec.writeFloat(out, map.vL1(), v1);
+        codec.writeFloat(out, map.vL2(), v2);
+        codec.writeFloat(out, map.vL3(), v3);
+
+        // --- B) Currents (u16 * 0.01 A * CT) ---
+        float i1 = (float)(0.01 * u16(blk97, 3) * acrelCt);  // 100
+        float i2 = (float)(0.01 * u16(blk97, 4) * acrelCt);  // 101
+        float i3 = (float)(0.01 * u16(blk97, 5) * acrelCt);  // 102
+        codec.writeFloat(out, map.iL1(), i1);
+        codec.writeFloat(out, map.iL2(), i2);
+        codec.writeFloat(out, map.iL3(), i3);
+
+        // --- C) Total Active Power (i32 * 0.001 kW * PT * CT) -> publish as Watts float ---
+        // blk356 is 356.., so index of 362 is (362-356)=6 (MSW,LSW order)
+        int pTotRaw = i32be(blk356, 6); // signed 32-bit
+        double pTotKw = pTotRaw * 0.001 * acrelPt * acrelCt;
+        float pTotW  = (float)(pTotKw * 1000.0);
+        codec.writeFloat(out, map.pTotal(), pTotW);
+
+        // (Optional) per-phase P at 356,358,360 if you decide to map pL1..pL3 later:
+//         codec.writeFloat(out, map.pL1(), (float)(i32be(blk356, 0)*0.001*acrelPt*acrelCt*1000));
+//         codec.writeFloat(out, map.pL2(), (float)(i32be(blk356, 2)*0.001*acrelPt*acrelCt*1000));
+//         codec.writeFloat(out, map.pL3(), (float)(i32be(blk356, 4)*0.001*acrelPt*acrelCt*1000));
+
+        float hz = 0.01f * u16(blk97, 22);
+        if (map.fHz() >= 0) codec.writeFloat(out, map.fHz(), hz);
+        return out;
+    }
+
+    // unsigned 16-bit to int
+    private static int u16(short[] a, int idx) {
+        if (a == null || idx < 0 || idx >= a.length) return 0;
+        return a[idx] & 0xFFFF;
+    }
+
+    // big-endian 32-bit signed from two 16-bit regs (MSW first)
+    private static int i32be(short[] a, int idx) {
+        // idx is the index of MSW within the block
+        int hi = u16(a, idx);
+        int lo = u16(a, idx + 1);
+        return (hi << 16) | lo;
     }
 }

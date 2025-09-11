@@ -51,6 +51,7 @@ logging:
         smartmetrapp: ${SMARTMETER_LOG_LEVEL:INFO}
 
 smartmetr:
+  kind: ${SMARTMETR_KIND:acrel}      # 'eastron' (current behavior) or 'acrel'
   cosPhiMin: ${SMARTMETR_COSPHI_MIN:0.85}
   smoothingWindow: ${SMARTMETR_SMOOTHING_WINDOW:5}
   deltaMaxKwPerSec: ${SMARTMETR_DELTA_MAX_KW_PER_SEC:2}
@@ -60,6 +61,10 @@ smartmetr:
   staleToZeroMs: ${SMARTMETR_STALE_TO_ZERO_MS:300000}
   rampDownMs: ${SMARTMETR_RAMP_DOWN_MS:2000}
   floatOrder: ${SMARTMETR_FLOAT_ORDER:BE}
+  fHz: ${SMARTMETR_FHZ:-1}
+  scale:
+    pt: ${SMARTMETR_ACREL_PT:1.0}
+    ct: ${SMARTMETR_ACREL_CT:1.0}
 
 management:
   endpoints:
@@ -91,6 +96,7 @@ meterMap:
   pL1:    ${METERMAP_PL1:12}
   pL2:    ${METERMAP_PL2:14}
   pL3:    ${METERMAP_PL3:16}
+
 
 alert:
   telegram:
