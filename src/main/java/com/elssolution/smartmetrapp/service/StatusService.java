@@ -74,7 +74,7 @@ public class StatusService {
 
         // --- Solis/grid figures ---
         double usedCompensateKw = overrideOn ? loadOverride.getCurrentDeltaKw() : 0.0;
-        double lastPsumKw = loadOverride.getPsumKw(); // +export / -import
+        double lastPsumKw = loadOverride.getLastPsumKw(); // +export / -import
         double importFromGrid = (!Double.isNaN(lastPsumKw) && lastPsumKw < 0) ? Math.abs(lastPsumKw) : 0.0;
         double pvKw = loadOverride.getLastDcPacKw();
         if (Double.isNaN(pvKw)) pvKw = loadOverride.getLastPacKw();

@@ -58,6 +58,9 @@ public class ModbusSmReader {
     private static final int ACREL_BLOCK2_START = 356;
     private static final int ACREL_BLOCK2_LEN   = 8;    // 356..363
 
+    private static final int IMAGE_MAX = 399; // mirror 0..399
+    private static final int BLOCK_LEN = 60;  // safe per-request chunk (<=125)
+
     // ==== State exposed to others ====
     private volatile SmSnapshot latestSnapshotSM = new SmSnapshot(new short[RAW_LEN], 0L); // ≥363
 
@@ -130,37 +133,29 @@ public class ModbusSmReader {
         }
     }
 
-    /** One Acrel read: fetch two ranges and place them into a single image array. */
-    private short[] readAcrelFrame() throws ModbusTransportException {
-        // 97..122 — U/I/Hz etc
-        ReadHoldingRegistersResponse r1 = (ReadHoldingRegistersResponse)
-                master.send(new ReadHoldingRegistersRequest(slaveId, ACREL_BLOCK1_START, ACREL_BLOCK1_LEN));
-        if (r1.isException()) throw new RuntimeException("Acrel " + ACREL_BLOCK1_START + ".." +
-                (ACREL_BLOCK1_START + ACREL_BLOCK1_LEN - 1) + " ex: " + r1.getExceptionMessage());
+    private short[] readAcrelFrame() {
+        short[] out = new short[RAW_LEN]; // RAW_LEN is 400 in your code
 
-        // 356..363 — P L1/L2/L3/Total (i32 be)
-        ReadHoldingRegistersResponse r2 = (ReadHoldingRegistersResponse)
-                master.send(new ReadHoldingRegistersRequest(slaveId, ACREL_BLOCK2_START, ACREL_BLOCK2_LEN));
-        if (r2.isException()) throw new RuntimeException("Acrel " + ACREL_BLOCK2_START + ".." +
-                (ACREL_BLOCK2_START + ACREL_BLOCK2_LEN - 1) + " ex: " + r2.getExceptionMessage());
-
-        // Build image
-        short[] out = new short[RAW_LEN];
-        copyBlock(out, ACREL_BLOCK1_START, r1.getShortData());
-        copyBlock(out, ACREL_BLOCK2_START, r2.getShortData());
+        for (int start = 0; start <= IMAGE_MAX; start += BLOCK_LEN) {
+            int len = Math.min(BLOCK_LEN, IMAGE_MAX - start + 1);
+            try {
+                ReadHoldingRegistersResponse r = (ReadHoldingRegistersResponse)
+                        master.send(new ReadHoldingRegistersRequest(slaveId, start, len));
+                if (!r.isException()) {
+                    short[] data = r.getShortData();
+                    int copy = Math.min(len, data.length);
+                    System.arraycopy(data, 0, out, start, copy);
+                } // if exception: meter might not implement this window → just skip
+            } catch (ModbusTransportException ex) {
+                // Skip this window and continue with the next; don't break the whole image
+                if (log.isTraceEnabled()) log.trace("skip window {}..{}: {}", start, start + len - 1, ex.toString());
+            } catch (Exception ex) {
+                if (log.isDebugEnabled()) log.debug("unexpected window error @{}: {}", start, ex.toString());
+            }
+        }
 
         if (log.isDebugEnabled()) {
-            int lo1 = Math.min(ACREL_BLOCK1_START, out.length);
-            int hi1 = Math.min(ACREL_BLOCK1_START + ACREL_BLOCK1_LEN, out.length);
-            int lo2 = Math.min(ACREL_BLOCK2_START, out.length);
-            int hi2 = Math.min(ACREL_BLOCK2_START + ACREL_BLOCK2_LEN, out.length);
-            if (hi1 > lo1 && hi2 > lo2) {
-                log.debug("acrel_read_ok: filled [{}..{}] & [{}..{}]",
-                        ACREL_BLOCK1_START, ACREL_BLOCK1_START + ACREL_BLOCK1_LEN - 1,
-                        ACREL_BLOCK2_START, ACREL_BLOCK2_START + ACREL_BLOCK2_LEN - 1);
-            } else {
-                log.debug("acrel_read_ok: imageLen={}", out.length);
-            }
+            log.debug("acrel_full_read_ok: mirrored holding 0..{}", IMAGE_MAX);
         }
         return out;
     }

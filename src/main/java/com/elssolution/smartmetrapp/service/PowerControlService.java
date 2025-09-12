@@ -74,9 +74,12 @@ public class PowerControlService {
             return out;
         }
 
+
         // 4) Apply compensation evenly across 3 phases
         final double pf         = clamp(minPf, 0.1, 1.0);
-        final double perPhaseW  = (compensateKw * 1000.0) / 3.0;
+        // Import is NEGATIVE on Acrel: to "increase import by +compensateKw",
+        // we must DECREASE P (make it more negative).
+        final double perPhaseW  = -(compensateKw * 1000.0) / 3.0;
 
         // Phase voltages in Volts
         final double v1 = 0.1 * u16(out, REG_V1) * pt;
@@ -129,14 +132,15 @@ public class PowerControlService {
     private double bumpPhaseCurrent(short[] w, int regI, double vVolt, double addW, double pf) {
         final int    rawNow = u16(w, regI);           // raw = 0.01 A * CT
         final double iA     = 0.01 * rawNow * ct;     // A
-        final double addA   = addW / Math.max(100.0, vVolt * pf);
+        // Currents are unsigned; always increase magnitude to match the larger |P|.
+        final double addA   = Math.abs(addW) / Math.max(100.0, vVolt * pf);
         final double iNew   = Math.max(0.0, iA + addA);
         final int    rawNew = (int) Math.round(iNew / (0.01 * ct));
         writeU16(w, regI, clampU16(rawNew));
         return addA;
     }
 
-    /** Add power to one phase: raw = W/(PT*CT). */
+    // Bump per-phase powers (356/358/360). Units: raw = W / (PT * CT). addW is NEGATIVE → more import
     private void bumpPhasePower(short[] w, int regPmsw, double addW) {
         final double pW  = i32be(w, regPmsw) * pt * ct;
         final double pNew = pW + addW;

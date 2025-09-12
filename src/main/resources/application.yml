@@ -57,7 +57,6 @@ smartmetr:
     maxKw: ${SMARTMETR_CLAMP_MAX_KW:50}
   staleToZeroMs: ${SMARTMETR_STALE_TO_ZERO_MS:300000}
   rampDownMs: ${SMARTMETR_RAMP_DOWN_MS:2000}
-
   scale:
     pt: ${SMARTMETR_ACREL_PT:1.0}
     ct: ${SMARTMETR_ACREL_CT:30.0}
@@ -93,3 +92,4 @@ alert:
     heartbeat:
       enabled: ${ALERT_TELEGRAM_HEARTBEAT_ENABLED:true}
       cron: "0 0 10 * * *"   # every day 10:00 local time
+
