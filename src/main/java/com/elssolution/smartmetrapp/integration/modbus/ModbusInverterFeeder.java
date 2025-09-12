@@ -108,7 +108,8 @@ public class ModbusInverterFeeder {
             // Pre-zero a safe range (optional but nice to avoid null/garbage reads on boot).
             if (initRegisters > 0) {
                 for (int i = 0; i < initRegisters; i++) {
-                    newImage.setInputRegister(i, (short) 0);
+                    newImage.setInputRegister(i, (short) 0);    // function 04
+                    newImage.setHoldingRegister(i,(short) 0);  // function 03
                 }
             }
 
@@ -167,7 +168,8 @@ public class ModbusInverterFeeder {
             synchronized (lock) {
                 if (image == null) return; // could be closed concurrently
                 for (int i = 0; i < frame.length; i++) {
-                    image.setInputRegister(i, frame[i]);
+                    image.setInputRegister(i, frame[i]);    // 04
+                    image.setHoldingRegister(i, frame[i]);   // 03  <-- NEW
                 }
                 lastWriteMs = System.currentTimeMillis();
             }
@@ -179,8 +181,28 @@ public class ModbusInverterFeeder {
                 log.debug("Compensate={} kW; wrote {} regs (min..max={}..{})",
                         deltaKw, frame.length, 0, frame.length - 1);
                 if (log.isTraceEnabled()) {
-                    log.trace("SM snapshot: {}", Arrays.toString(snap.data));
-                    log.trace("Output frame: {}", Arrays.toString(frame));
+                    // guards for nulls and length
+                    if (snap != null && snap.data != null) {
+                        int lo = Math.min(97, snap.data.length);
+                        int hi = Math.min(123, snap.data.length);
+                        if (hi > lo) {
+                            log.trace("SM snapshot slice(97..123): {}",
+                                    Arrays.toString(Arrays.copyOfRange(snap.data, lo, hi)));
+                        } else {
+                            log.trace("SM snapshot len={}", snap.data.length);
+                        }
+                    } else {
+                        log.trace("SM snapshot: <null>");
+                    }
+
+                    int lo2 = Math.min(97, frame.length);
+                    int hi2 = Math.min(123, frame.length);
+                    if (hi2 > lo2) {
+                        log.trace("Output slice(97..123): {}",
+                                Arrays.toString(Arrays.copyOfRange(frame, lo2, hi2)));
+                    } else {
+                        log.trace("Output frame len={}", frame.length);
+                    }
                 }
             }
 

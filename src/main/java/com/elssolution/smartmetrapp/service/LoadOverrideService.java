@@ -73,6 +73,20 @@ public class LoadOverrideService {
 
     @PostConstruct
     void startPolling() {
+        // sanitize knobs
+        if (minImportKw < 0) {
+            log.warn("minImportKw < 0 ({}). Clamping to 0.", minImportKw);
+            minImportKw = 0;
+        }
+        if (smoothingFactor < 0 || smoothingFactor > 1) {
+            log.warn("smoothingFactor out of [0..1] ({}). Using 1.0 (no smoothing).", smoothingFactor);
+            smoothingFactor = 1.0;
+        }
+        if (maxDataAgeMs < 5_000) {
+            log.warn("maxDataAgeMs too small ({}). Bumping to 5000 ms.", maxDataAgeMs);
+            maxDataAgeMs = 5_000;
+        }
+
         scheduler.scheduleWithFixedDelay(this::pollOnceSafe, 5, fetchPeriodSeconds, TimeUnit.SECONDS);
         log.info("Solis override polling started: every={}s, minImportKw={} kW, maxDataAgeMs={}, smoothingFactor={}",
                 fetchPeriodSeconds, minImportKw, maxDataAgeMs, smoothingFactor);
@@ -88,7 +102,7 @@ public class LoadOverrideService {
             }
 
             alerts.resolve("SOLIS_STALE");
-            var r = opt.get();
+            SolisCloudClient.SolisDetail r = opt.get();
 
             // Cache values for UI
             lastPsumKw       = r.psumKw();
@@ -116,6 +130,8 @@ public class LoadOverrideService {
 
     /** EMA clamp-and-apply. If smoothing ∉ (0,1), returns target directly. */
     private static double ema(double prev, double target, double smoothing) {
+        if (!Double.isFinite(target)) return 0.0;
+        if (!Double.isFinite(prev))   prev = 0.0;
         if (smoothing <= 0.0 || smoothing >= 1.0) return target;
         return smoothing * target + (1.0 - smoothing) * prev;
     }

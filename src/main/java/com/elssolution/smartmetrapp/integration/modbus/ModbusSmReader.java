@@ -38,7 +38,6 @@ import java.util.concurrent.TimeUnit;
 @Service
 @Getter @Setter
 public class ModbusSmReader {
-
     // ==== Config ====
     @Value("${serial.input.port}")        private String port;
     @Value("${serial.input.baudRate}")    private int baudRate;
@@ -50,8 +49,17 @@ public class ModbusSmReader {
     @Value("${serial.input.warmupMs:2000}")           private int warmupMs;
     @Value("${serial.input.timeoutsBeforeReopen:3}")  private int timeoutsBeforeReopen;
 
+    // Constant
+    private static final int RAW_LEN = 400;
+
+    private static final int ACREL_BLOCK1_START = 97;
+    private static final int ACREL_BLOCK1_LEN   = 26;   // 97..122
+
+    private static final int ACREL_BLOCK2_START = 356;
+    private static final int ACREL_BLOCK2_LEN   = 8;    // 356..363
+
     // ==== State exposed to others ====
-    private volatile SmSnapshot latestSnapshotSM = new SmSnapshot(new short[400], 0L); // ≥363
+    private volatile SmSnapshot latestSnapshotSM = new SmSnapshot(new short[RAW_LEN], 0L); // ≥363
 
     // ==== Infra ====
     private final ScheduledExecutorService scheduler;
@@ -126,19 +134,34 @@ public class ModbusSmReader {
     private short[] readAcrelFrame() throws ModbusTransportException {
         // 97..122 — U/I/Hz etc
         ReadHoldingRegistersResponse r1 = (ReadHoldingRegistersResponse)
-                master.send(new ReadHoldingRegistersRequest(slaveId, 97, 26));
-        if (r1.isException()) throw new RuntimeException("Acrel 97..122 ex: " + r1.getExceptionMessage());
+                master.send(new ReadHoldingRegistersRequest(slaveId, ACREL_BLOCK1_START, ACREL_BLOCK1_LEN));
+        if (r1.isException()) throw new RuntimeException("Acrel " + ACREL_BLOCK1_START + ".." +
+                (ACREL_BLOCK1_START + ACREL_BLOCK1_LEN - 1) + " ex: " + r1.getExceptionMessage());
 
         // 356..363 — P L1/L2/L3/Total (i32 be)
         ReadHoldingRegistersResponse r2 = (ReadHoldingRegistersResponse)
-                master.send(new ReadHoldingRegistersRequest(slaveId, 356, 8));
-        if (r2.isException()) throw new RuntimeException("Acrel 356..363 ex: " + r2.getExceptionMessage());
+                master.send(new ReadHoldingRegistersRequest(slaveId, ACREL_BLOCK2_START, ACREL_BLOCK2_LEN));
+        if (r2.isException()) throw new RuntimeException("Acrel " + ACREL_BLOCK2_START + ".." +
+                (ACREL_BLOCK2_START + ACREL_BLOCK2_LEN - 1) + " ex: " + r2.getExceptionMessage());
 
         // Build image
-        short[] out = new short[400]; // roomy; >= 364
-        copyBlock(out, 97,  r1.getShortData());
-        copyBlock(out, 356, r2.getShortData());
-        if (log.isDebugEnabled()) log.debug("acrel_read_ok: filled [97..122] & [356..363]");
+        short[] out = new short[RAW_LEN];
+        copyBlock(out, ACREL_BLOCK1_START, r1.getShortData());
+        copyBlock(out, ACREL_BLOCK2_START, r2.getShortData());
+
+        if (log.isDebugEnabled()) {
+            int lo1 = Math.min(ACREL_BLOCK1_START, out.length);
+            int hi1 = Math.min(ACREL_BLOCK1_START + ACREL_BLOCK1_LEN, out.length);
+            int lo2 = Math.min(ACREL_BLOCK2_START, out.length);
+            int hi2 = Math.min(ACREL_BLOCK2_START + ACREL_BLOCK2_LEN, out.length);
+            if (hi1 > lo1 && hi2 > lo2) {
+                log.debug("acrel_read_ok: filled [{}..{}] & [{}..{}]",
+                        ACREL_BLOCK1_START, ACREL_BLOCK1_START + ACREL_BLOCK1_LEN - 1,
+                        ACREL_BLOCK2_START, ACREL_BLOCK2_START + ACREL_BLOCK2_LEN - 1);
+            } else {
+                log.debug("acrel_read_ok: imageLen={}", out.length);
+            }
+        }
         return out;
     }
 
@@ -178,9 +201,14 @@ public class ModbusSmReader {
     private void closeQuietly() {
         synchronized (masterLock) {
             if (master != null) {
-                try { master.destroy(); } catch (Exception ignore) {}
-                master = null;
-                log.info("meter_port_closed port={}", port);
+                try {
+                    master.destroy();
+                } catch (Exception ignore) {
+                    // best-effort
+                } finally {
+                    master = null;
+                    log.info("meter_port_closed port={}", port);
+                }
             }
         }
     }
