@@ -67,6 +67,7 @@ smartmetr:
   scale:
     pt: ${SMARTMETR_ACREL_PT:1.0}
     ct: ${SMARTMETR_ACREL_CT:30.0}
+  editCurrents: false
 
 
 management:

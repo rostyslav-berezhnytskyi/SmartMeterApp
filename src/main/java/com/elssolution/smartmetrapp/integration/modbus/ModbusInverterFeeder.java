@@ -73,7 +73,7 @@ public class ModbusInverterFeeder {
 
     // ===== Runtime state =====
     private final Object lock = new Object();
-    private volatile BasicProcessImage image;     // current process image
+    private volatile AtomicSnapshotImage image;    // current process image
     private volatile ModbusSlaveSet slave;        // serial Modbus slave
     private volatile boolean up = false;
 
@@ -116,15 +116,9 @@ public class ModbusInverterFeeder {
         try {
             SerialPortWrapper wrapper = new SerialPortWrapperImpl(port, baudRate);
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
-            BasicProcessImage newImage = new BasicProcessImage(slaveId);
 
-            // Keep optional pre-zero, but default is 0 (disabled)
-            if (initRegisters > 0) {
-                for (int i = 0; i < initRegisters; i++) {
-                    newImage.setInputRegister(i, (short) 0);   // 04
-                    newImage.setHoldingRegister(i, (short) 0); // 03
-                }
-            }
+            // <<< swap in the atomic image >>>
+            AtomicSnapshotImage newImage = new AtomicSnapshotImage(slaveId, Math.max(400, initRegisters));
 
             newSlave.addProcessImage(newImage);
             newSlave.start();
@@ -136,9 +130,6 @@ public class ModbusInverterFeeder {
             }
             log.info("Inverter-slave opened: port={} baud={} initRegisters={}", port, baudRate, initRegisters);
             alerts.resolve("INVERTER_RTU_DOWN");
-
-            // NEW: publish immediately after open (no zero-frame window)
-            initialPublishAfterOpen();
 
         } catch (ModbusInitException e) {
             alerts.raise("INVERTER_RTU_DOWN",
@@ -264,44 +255,19 @@ public class ModbusInverterFeeder {
     private boolean hasFreshFrame(long maxAgeMs) {
         SmSnapshot s = smReader.getLatestSnapshotSM();
         if (s == null || s.updatedAtMs == 0L) return false;
-        return (System.currentTimeMillis() - s.updatedAtMs) <= Math.max(0L, maxSmAgeForWriteMs);
-    }
-
-    // publish immediately after open using last output or a fresh build
-    private void initialPublishAfterOpen() {
-        try {
-            short[] frame = outputData; // last good
-            if (frame == null) {
-                SmSnapshot snap = smReader.getLatestSnapshotSM();
-                double deltaKw = loadOverride.getCurrentDeltaKw();
-                frame = powerControl.prepareOutputWords(snap, deltaKw);
-            }
-            if (frame != null) {
-                publishFullFrame(frame);
-                alerts.resolve("INVERTER_OUTPUT_STALE");
-            }
-        } catch (Exception e) {
-            alerts.raise("INVERTER_WRITE_FAIL",
-                    "Inverter-slave initial publish failed: " + e.getMessage(),
-                    AlertService.Severity.WARN);
-            closeQuietly();
-        }
+        long age = System.currentTimeMillis() - s.updatedAtMs;
+        return age <= Math.max(0L, maxAgeMs);
     }
 
     // single place that writes the WHOLE frame to 04 & 03
     private void publishFullFrame(short[] frame) {
-        int writeCount = Math.max(initRegisters, frame.length);
-        synchronized (lock) {
-            if (image == null) return;
-            for (int i = 0; i < writeCount; i++) {
-                short v = (i < frame.length) ? frame[i] : 0;
-                image.setInputRegister(i, v);   // 04
-                image.setHoldingRegister(i, v); // 03
-            }
-            lastWriteMs = System.currentTimeMillis();
-        }
-        outputData = frame;
+        AtomicSnapshotImage img = image;
+        if (img == null) return;
+        img.publish(frame);                     // <<< atomic pointer swap, no tearing >>>
+        lastWriteMs = System.currentTimeMillis();
+        outputData  = frame;
     }
+
 
 
 }

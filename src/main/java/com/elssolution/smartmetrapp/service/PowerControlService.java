@@ -40,6 +40,9 @@ public class PowerControlService {
     /** Guard in I = P/(V*pf) to avoid huge currents when V is tiny. */
     @Value("${smartmetr.safeDivMinVolt:100.0}")private double safeDivMinVolt;
 
+    @Value("${smartmetr.editCurrents:false}")
+    private boolean editCurrents;
+
     // ====== Acrel register addresses ======
     private static final int REG_V1   =  97;
     private static final int REG_V2   =  98;
@@ -60,81 +63,56 @@ public class PowerControlService {
      * @return the register image to expose to the inverter (same layout as input, with edits)
      */
     public short[] prepareOutputWords(SmSnapshot snapshot, double compensateKw) {
-        // 1) Start from meter words (pass-through everything we don’t touch)
         short[] base = (snapshot != null && snapshot.data != null) ? snapshot.data : new short[0];
-        short[] out  = ensureCapacity(base, 364);   // need at least up to reg 363
+        short[] out  = ensureCapacity(base, 364);
 
-        // Normalize scalers (avoid 0/NaN)
         final double PT = (pt > 0 && Double.isFinite(pt)) ? pt : 1.0;
         final double CT = (ct > 0 && Double.isFinite(ct)) ? ct : 1.0;
 
-        // 2) PURE PASS-THROUGH when no compensation requested (override OFF)
-        if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) {
-            return out;
-        }
+        // If override disabled or T <= 0 → pure pass-through
+        if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) return out;
 
-        // 3) For active compensation: block stale/offline frames
+        // If snapshot stale/offline → publish zeros (fail-safe) or just pass-through; your choice
         final long age = (snapshot == null || snapshot.updatedAtMs == 0)
-                ? Long.MAX_VALUE
-                : (System.currentTimeMillis() - snapshot.updatedAtMs);
+                ? Long.MAX_VALUE : (System.currentTimeMillis() - snapshot.updatedAtMs);
+        if (age > maxAgeMs || acrelOffline(out, PT)) return out; // <- or zeroCurrentsAndPowers(out);
 
-        if (age > maxAgeMs || acrelOffline(out, PT)) {
-            zeroCurrentsAndPowers(out);
-            return out;
-        }
+        // Read current powers
+        final double p1W  = i32be(out, REG_P1  ) * PT * CT;
+        final double p2W  = i32be(out, REG_P2  ) * PT * CT;
+        final double p3W  = i32be(out, REG_P3  ) * PT * CT;
+        final double pTotW= i32be(out, REG_PTOT) * PT * CT;
 
-        // Phase voltages in Volts
+        // Desired published total = P_actual - T
+        final double biasW = compensateKw * 1000.0;
+        final double pTotPublishedW = pTotW - biasW;
+        final double dW = pTotPublishedW - pTotW; // this is just -biasW
+
+        // Distribute the same offset across alive phases (equal split is fine)
         final double v1 = 0.1 * u16(out, REG_V1) * PT;
         final double v2 = 0.1 * u16(out, REG_V2) * PT;
         final double v3 = 0.1 * u16(out, REG_V3) * PT;
-
-        // Decide which phases are alive
-        boolean a1 = v1 >= phaseMinVolt;
-        boolean a2 = v2 >= phaseMinVolt;
-        boolean a3 = v3 >= phaseMinVolt;
+        boolean a1 = v1 >= phaseMinVolt, a2 = v2 >= phaseMinVolt, a3 = v3 >= phaseMinVolt;
         int alive = (a1?1:0) + (a2?1:0) + (a3?1:0);
+        if (alive == 0) return out;
 
-        if (alive == 0) {
-            // meter says all phases are essentially dead → fail-safe
-            zeroCurrentsAndPowers(out);
-            return out;
-        }
+        double perAlive = dW / alive;
 
-        // 4) Apply compensation across alive phases (import is NEGATIVE on Acrel)
-        final double pf = clamp(minPf, 0.1, 1.0);
-        final double totalW = compensateKw * 1000.0;
-        final double perAliveW = -(totalW / alive);        // negative = "more import"
-
-        double sumAddW = 0.0;
-
+        // IMPORTANT: do NOT edit currents (let inverter lock to P)
         if (a1) {
-            double dI = bumpPhaseCurrent(out, REG_I1, v1, perAliveW, pf, CT);
-            bumpPhasePower(out, REG_P1, perAliveW, PT, CT);
-            sumAddW += perAliveW;
-            if (log.isTraceEnabled()) log.trace("L1: V={}V ΔI≈{}A addW={}W", to2(v1), to2(dI), Math.round(perAliveW));
+            if (editCurrents) /*bumpPhaseCurrent(out, REG_I1, ...);*/  // keep disabled by default
+                writeI32be(out, REG_P1, toRawPower(p1W + perAlive, PT, CT));
         }
         if (a2) {
-            double dI = bumpPhaseCurrent(out, REG_I2, v2, perAliveW, pf, CT);
-            bumpPhasePower(out, REG_P2, perAliveW, PT, CT);
-            sumAddW += perAliveW;
-            if (log.isTraceEnabled()) log.trace("L2: V={}V ΔI≈{}A addW={}W", to2(v2), to2(dI), Math.round(perAliveW));
+            if (editCurrents) /*bumpPhaseCurrent(out, REG_I2, ...);*/
+                writeI32be(out, REG_P2, toRawPower(p2W + perAlive, PT, CT));
         }
         if (a3) {
-            double dI = bumpPhaseCurrent(out, REG_I3, v3, perAliveW, pf, CT);
-            bumpPhasePower(out, REG_P3, perAliveW, PT, CT);
-            sumAddW += perAliveW;
-            if (log.isTraceEnabled()) log.trace("L3: V={}V ΔI≈{}A addW={}W", to2(v3), to2(dI), Math.round(perAliveW));
+            if (editCurrents) /*bumpPhaseCurrent(out, REG_I3, ...);*/
+                writeI32be(out, REG_P3, toRawPower(p3W + perAlive, PT, CT));
         }
 
-        // Bump total power (keep sign convention)
-        final double pTotW    = i32be(out, REG_PTOT) * PT * CT;
-        final double pTotWNew = pTotW + sumAddW;
-        writeI32be(out, REG_PTOT, toRawPower(pTotWNew, PT, CT));
-
-        if (log.isDebugEnabled()) {
-            log.debug("compensate={}kW (alive phases={}) → ~{}W per-alive @pf={} → ΔPtot={}W",
-                    to3(compensateKw), alive, Math.round(-perAliveW), to2(pf), Math.round(sumAddW));
-        }
+        writeI32be(out, REG_PTOT, toRawPower(pTotPublishedW, PT, CT));
 
         return out;
     }
