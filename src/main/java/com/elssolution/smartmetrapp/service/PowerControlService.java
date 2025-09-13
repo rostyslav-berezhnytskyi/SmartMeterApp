@@ -12,29 +12,35 @@ import org.springframework.stereotype.Component;
  *   1) Clone the latest Acrel raw frame (pass-through by default).
  *   2) If no compensation requested (override OFF or <=0) → pure pass-through (no edits).
  *   3) If compensation requested but frame is stale/offline → zero I/P for safety.
- *   4) Else add compensateKw across phases:
+ *   4) Else add compensateKw across *alive* phases (V >= phaseMinVolt):
  *        - Currents at 100/101/102 (raw: 0.01 A * CT).
  *        - Per-phase P at 356/358/360 (raw: W / (PT * CT)).
  *        - Total P at 362 (same raw).
  *
  * Acrel registers:
- *   V L1..L3:    97..99   (u16, value = 0.1 V * PT)
- *   I L1..L3:   100..102  (u16, value = 0.01 A * CT)
- *   Hz:           119     (u16, value = 0.01 Hz)  // not used here, but documented
- *   P L1/L2/L3: 356/358/360 (i32, raw = W / (PT * CT), MSW first)
- *   P Total:     362        (i32, raw = W / (PT * CT), MSW first)
+ *   V L1..L3:      97..99   (u16, value = 0.1 V * PT)
+ *   I L1..L3:     100..102  (u16, value = 0.01 A * CT)
+ *   Hz:             119     (u16, value = 0.01 Hz)
+ *   P L1/L2/L3:   356/358/360 (i32, raw = W / (PT * CT), MSW first)
+ *   P Total:       362        (i32, raw = W / (PT * CT), MSW first)
  */
 @Slf4j
 @Component
 public class PowerControlService {
 
     // ====== Config (from application.yml) ======
-    @Value("${smartmetr.scale.pt:1.0}")   private double pt;            // PT ratio
-    @Value("${smartmetr.scale.ct:1.0}")   private double ct;            // CT ratio
-    @Value("${smartmetr.cosPhiMin:0.95}") private double minPf;         // lower bound for PF
-    @Value("${smartmetr.staleToZeroMs:300000}") private long  maxAgeMs; // data freshness gate (ms)
+    @Value("${smartmetr.scale.pt:1.0}")        private double pt;                // PT ratio
+    @Value("${smartmetr.scale.ct:1.0}")        private double ct;                // CT ratio
+    @Value("${smartmetr.cosPhiMin:0.95}")      private double minPf;             // lower bound for PF
+    @Value("${smartmetr.staleToZeroMs:300000}")private long   maxAgeMs;          // data freshness gate (ms)
 
-    // ====== Acrel register addresses (named for clarity) ======
+    /** A phase is considered "alive" if its phase-to-neutral V >= this. */
+    @Value("${smartmetr.phaseMinVolt:100.0}")  private double phaseMinVolt;
+
+    /** Guard in I = P/(V*pf) to avoid huge currents when V is tiny. */
+    @Value("${smartmetr.safeDivMinVolt:100.0}")private double safeDivMinVolt;
+
+    // ====== Acrel register addresses ======
     private static final int REG_V1   =  97;
     private static final int REG_V2   =  98;
     private static final int REG_V3   =  99;
@@ -58,8 +64,11 @@ public class PowerControlService {
         short[] base = (snapshot != null && snapshot.data != null) ? snapshot.data : new short[0];
         short[] out  = ensureCapacity(base, 364);   // need at least up to reg 363
 
+        // Normalize scalers (avoid 0/NaN)
+        final double PT = (pt > 0 && Double.isFinite(pt)) ? pt : 1.0;
+        final double CT = (ct > 0 && Double.isFinite(ct)) ? ct : 1.0;
+
         // 2) PURE PASS-THROUGH when no compensation requested (override OFF)
-        //    This keeps the inverter seeing exactly what the meter reports.
         if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) {
             return out;
         }
@@ -69,41 +78,62 @@ public class PowerControlService {
                 ? Long.MAX_VALUE
                 : (System.currentTimeMillis() - snapshot.updatedAtMs);
 
-        if (age > maxAgeMs || acrelOffline(out)) {
+        if (age > maxAgeMs || acrelOffline(out, PT)) {
             zeroCurrentsAndPowers(out);
             return out;
         }
 
-
-        // 4) Apply compensation evenly across 3 phases
-        final double pf         = clamp(minPf, 0.1, 1.0);
-        // Import is NEGATIVE on Acrel: to "increase import by +compensateKw",
-        // we must DECREASE P (make it more negative).
-        final double perPhaseW  = -(compensateKw * 1000.0) / 3.0;
-
         // Phase voltages in Volts
-        final double v1 = 0.1 * u16(out, REG_V1) * pt;
-        final double v2 = 0.1 * u16(out, REG_V2) * pt;
-        final double v3 = 0.1 * u16(out, REG_V3) * pt;
+        final double v1 = 0.1 * u16(out, REG_V1) * PT;
+        final double v2 = 0.1 * u16(out, REG_V2) * PT;
+        final double v3 = 0.1 * u16(out, REG_V3) * PT;
 
-        // Bump currents (regs 100..102). Units: raw = 0.01 A * CT
-        final double dI1 = bumpPhaseCurrent(out, REG_I1, v1, perPhaseW, pf);
-        final double dI2 = bumpPhaseCurrent(out, REG_I2, v2, perPhaseW, pf);
-        final double dI3 = bumpPhaseCurrent(out, REG_I3, v3, perPhaseW, pf);
+        // Decide which phases are alive
+        boolean a1 = v1 >= phaseMinVolt;
+        boolean a2 = v2 >= phaseMinVolt;
+        boolean a3 = v3 >= phaseMinVolt;
+        int alive = (a1?1:0) + (a2?1:0) + (a3?1:0);
 
-        // Bump per-phase powers (356/358/360). Units: raw = W / (PT * CT)
-        bumpPhasePower(out, REG_P1, perPhaseW);
-        bumpPhasePower(out, REG_P2, perPhaseW);
-        bumpPhasePower(out, REG_P3, perPhaseW);
+        if (alive == 0) {
+            // meter says all phases are essentially dead → fail-safe
+            zeroCurrentsAndPowers(out);
+            return out;
+        }
 
-        // Bump total power (362)
-        final double pTotW    = i32be(out, REG_PTOT) * pt * ct;
-        final double pTotWNew = pTotW + (3 * perPhaseW);
-        writeI32be(out, REG_PTOT, toRawPower(pTotWNew));
+        // 4) Apply compensation across alive phases (import is NEGATIVE on Acrel)
+        final double pf = clamp(minPf, 0.1, 1.0);
+        final double totalW = compensateKw * 1000.0;
+        final double perAliveW = -(totalW / alive);        // negative = "more import"
+
+        double sumAddW = 0.0;
+
+        if (a1) {
+            double dI = bumpPhaseCurrent(out, REG_I1, v1, perAliveW, pf, CT);
+            bumpPhasePower(out, REG_P1, perAliveW, PT, CT);
+            sumAddW += perAliveW;
+            if (log.isTraceEnabled()) log.trace("L1: V={}V ΔI≈{}A addW={}W", to2(v1), to2(dI), Math.round(perAliveW));
+        }
+        if (a2) {
+            double dI = bumpPhaseCurrent(out, REG_I2, v2, perAliveW, pf, CT);
+            bumpPhasePower(out, REG_P2, perAliveW, PT, CT);
+            sumAddW += perAliveW;
+            if (log.isTraceEnabled()) log.trace("L2: V={}V ΔI≈{}A addW={}W", to2(v2), to2(dI), Math.round(perAliveW));
+        }
+        if (a3) {
+            double dI = bumpPhaseCurrent(out, REG_I3, v3, perAliveW, pf, CT);
+            bumpPhasePower(out, REG_P3, perAliveW, PT, CT);
+            sumAddW += perAliveW;
+            if (log.isTraceEnabled()) log.trace("L3: V={}V ΔI≈{}A addW={}W", to2(v3), to2(dI), Math.round(perAliveW));
+        }
+
+        // Bump total power (keep sign convention)
+        final double pTotW    = i32be(out, REG_PTOT) * PT * CT;
+        final double pTotWNew = pTotW + sumAddW;
+        writeI32be(out, REG_PTOT, toRawPower(pTotWNew, PT, CT));
 
         if (log.isDebugEnabled()) {
-            log.debug("compensate={}kW → +{}W/phase @pf={} → ΔI≈[{},{},{}] A",
-                    to3(compensateKw), Math.round(perPhaseW), to2(pf), to2(dI1), to2(dI2), to2(dI3));
+            log.debug("compensate={}kW (alive phases={}) → ~{}W per-alive @pf={} → ΔPtot={}W",
+                    to3(compensateKw), alive, Math.round(-perAliveW), to2(pf), Math.round(sumAddW));
         }
 
         return out;
@@ -111,10 +141,10 @@ public class PowerControlService {
 
     // ====== Acrel helpers ======
 
-    private boolean acrelOffline(short[] w) {
-        final double v1 = 0.1 * u16(w, REG_V1) * pt;
-        final double v2 = 0.1 * u16(w, REG_V2) * pt;
-        final double v3 = 0.1 * u16(w, REG_V3) * pt;
+    private boolean acrelOffline(short[] w, double PT) {
+        final double v1 = 0.1 * u16(w, REG_V1) * PT;
+        final double v2 = 0.1 * u16(w, REG_V2) * PT;
+        final double v3 = 0.1 * u16(w, REG_V3) * PT;
         return (v1 < 1.0 && v2 < 1.0 && v3 < 1.0);
     }
 
@@ -128,27 +158,27 @@ public class PowerControlService {
         writeI32be(w, REG_PTOT, 0);
     }
 
-    /** Add current to one phase: ΔI = P / (V * PF), then convert to raw (0.01 A * CT). Returns ΔI (A). */
-    private double bumpPhaseCurrent(short[] w, int regI, double vVolt, double addW, double pf) {
-        final int    rawNow = u16(w, regI);           // raw = 0.01 A * CT
-        final double iA     = 0.01 * rawNow * ct;     // A
-        // Currents are unsigned; always increase magnitude to match the larger |P|.
-        final double addA   = Math.abs(addW) / Math.max(100.0, vVolt * pf);
+    /** Add current to one phase: ΔI = |P| / (max(safeDivMinVolt, V*PF)), raw = 0.01 A * CT. Returns ΔI (A). */
+    private double bumpPhaseCurrent(short[] w, int regI, double vVolt, double addW, double pf, double CT) {
+        final double denomV = Math.max(safeDivMinVolt, vVolt * pf);
+        final int    rawNow = u16(w, regI);               // raw = 0.01 A * CT
+        final double iA     = 0.01 * rawNow * CT;         // A
+        final double addA   = Math.abs(addW) / denomV;    // always increase magnitude
         final double iNew   = Math.max(0.0, iA + addA);
-        final int    rawNew = (int) Math.round(iNew / (0.01 * ct));
+        final int    rawNew = (int) Math.round(iNew / (0.01 * CT));
         writeU16(w, regI, clampU16(rawNew));
         return addA;
     }
 
     // Bump per-phase powers (356/358/360). Units: raw = W / (PT * CT). addW is NEGATIVE → more import
-    private void bumpPhasePower(short[] w, int regPmsw, double addW) {
-        final double pW  = i32be(w, regPmsw) * pt * ct;
+    private void bumpPhasePower(short[] w, int regPmsw, double addW, double PT, double CT) {
+        final double pW   = i32be(w, regPmsw) * PT * CT;
         final double pNew = pW + addW;
-        writeI32be(w, regPmsw, toRawPower(pNew));
+        writeI32be(w, regPmsw, toRawPower(pNew, PT, CT));
     }
 
-    private int toRawPower(double watts) {
-        final double den = Math.max(1e-6, pt * ct);
+    private int toRawPower(double watts, double PT, double CT) {
+        final double den = Math.max(1e-6, PT * CT);
         final double raw = watts / den;
         if (raw > Integer.MAX_VALUE) return Integer.MAX_VALUE;
         if (raw < Integer.MIN_VALUE) return Integer.MIN_VALUE;
@@ -169,7 +199,7 @@ public class PowerControlService {
         if (a == null || msw < 0 || msw + 1 >= a.length) return 0;
         int hi = u16(a, msw);
         int lo = u16(a, msw + 1);
-        return (hi << 16) | lo;
+        return (hi << 16) | lo; // signed int result (two's complement preserved)
     }
     private static void writeI32be(short[] a, int msw, int value) {
         if (a == null || msw < 0 || msw + 1 >= a.length) return;

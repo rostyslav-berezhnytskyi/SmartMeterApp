@@ -10,6 +10,9 @@ serial:
     reopenBackoffMs: ${SERIAL_REOPEN_BACKOFF_MS:2000}
     warmupMs: ${SERIAL_WARMUP_MS:2000}
     timeoutsBeforeReopen: ${SERIAL_TIMEOUTS_BEFORE_REOPEN:3}
+    meterStaleMs: ${SERIAL_METER_STALE:30000}
+    maxWindowErrorsBeforeReopen: 3
+    staleAlertMinPeriodMs: 10000
 
   output:
     port: ${SERIAL_OUTPUT_PORT:COM11}
@@ -17,6 +20,8 @@ serial:
     slaveId: ${SERIAL_OUTPUT_SLAVE:1}
     pollInterval: ${SERIAL_OUTPUT_POLL:1000}
     initRegisters: ${SERIAL_OUTPUT_INIT_REGS:400}
+    maxSmAgeForWriteMs: 60000      # don’t publish if the meter snapshot is older
+    outStaleMs: 30000              # alert if we haven’t written in this long
 
 devtools:
   restart:
@@ -60,6 +65,7 @@ smartmetr:
   scale:
     pt: ${SMARTMETR_ACREL_PT:1.0}
     ct: ${SMARTMETR_ACREL_CT:30.0}
+
 
 management:
   endpoints:

@@ -22,16 +22,6 @@ import java.util.Arrays;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-/**
- * Exposes a Modbus-RTU *slave* on the RS-485/serial port that the inverter reads.
- * Each second we:
- *   1) get the latest Acrel snapshot (raw frame),
- *   2) get the current compensation (kW) from LoadOverrideService,
- *   3) ask PowerControlService to build the outgoing register image,
- *   4) write the *entire* image into the slave's input registers.
- *
- * Acrel-only: we write native Acrel register positions (e.g. 97..102, 356..362).
- */
 @Slf4j
 @Component
 @Getter
@@ -62,22 +52,26 @@ public class ModbusInverterFeeder {
     @Value("${serial.output.port}")     private String port;
     @Value("${serial.output.baudRate}") private int    baudRate;
 
-    /**
-     * Optional: how many input registers to pre-zero on open.
-     * Must be >= 364 for Acrel (so total power at 362 exists).
-     * You can set to 0 to skip pre-initialization.
-     */
+    /** Pre-zero this many registers on open (04 & 03). Should cover every index the inverter might read. */
     @Value("${serial.output.initRegisters:400}")
     private int initRegisters;
 
-    // ===== Runtime state =====
-    private final Object lock = new Object();          // guards image/slave during writes & close
-    private volatile BasicProcessImage image;          // current "process image"
-    private volatile ModbusSlaveSet slave;             // serial Modbus slave
-    private volatile boolean up = false;               // opened and running
+    /** If meter snapshot is older than this, do not overwrite the image (avoid feeding junk). */
+    @Value("${serial.output.maxSmAgeForWriteMs:60000}")
+    private long maxSmAgeForWriteMs;
 
-    private volatile short[] outputData;               // last frame we published (for UI)
-    private volatile long lastWriteMs = 0L;            // when we last wrote registers
+    /** Raise INVERTER_OUTPUT_STALE if we haven’t successfully written for this long. */
+    @Value("${serial.output.outStaleMs:30000}")
+    private long outStaleMs;
+
+    // ===== Runtime state =====
+    private final Object lock = new Object();
+    private volatile BasicProcessImage image;     // current process image
+    private volatile ModbusSlaveSet slave;        // serial Modbus slave
+    private volatile boolean up = false;
+
+    private volatile short[] outputData;          // last frame we published (for UI)
+    private volatile long lastWriteMs = 0L;       // last successful publish time
 
     // ===== Lifecycle =====
     @PostConstruct
@@ -86,6 +80,8 @@ public class ModbusInverterFeeder {
         scheduler.scheduleWithFixedDelay(this::ensureOpen, 0, 5, TimeUnit.SECONDS);
         // Data push loop
         scheduler.scheduleAtFixedRate(this::tick, 1, 1, TimeUnit.SECONDS);
+        // Output staleness watchdog (no annotations)
+        scheduler.scheduleWithFixedDelay(this::watchOutputStaleness, 5, 2, TimeUnit.SECONDS);
     }
 
     // ===== Open/Close =====
@@ -105,11 +101,11 @@ public class ModbusInverterFeeder {
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
             BasicProcessImage newImage = new BasicProcessImage(slaveId);
 
-            // Pre-zero a safe range (optional but nice to avoid null/garbage reads on boot).
+            // Pre-zero a safe range (both 04 & 03, some devices read either)
             if (initRegisters > 0) {
                 for (int i = 0; i < initRegisters; i++) {
-                    newImage.setInputRegister(i, (short) 0);    // function 04
-                    newImage.setHoldingRegister(i,(short) 0);  // function 03
+                    newImage.setInputRegister(i, (short) 0);   // function 04
+                    newImage.setHoldingRegister(i, (short) 0); // function 03
                 }
             }
 
@@ -158,31 +154,57 @@ public class ModbusInverterFeeder {
             // 1) Meter snapshot (raw Acrel registers)
             SmSnapshot snap = smReader.getLatestSnapshotSM();
 
+            // Gate on availability: don’t overwrite the image before first good meter frame
+            if (snap == null || snap.updatedAtMs == 0L) {
+                alerts.raise("INVERTER_FEEDER_WAITING_FOR_METER", "Waiting for first meter frame…",
+                        AlertService.Severity.WARN);
+                return;
+            } else {
+                alerts.resolve("INVERTER_FEEDER_WAITING_FOR_METER");
+            }
+
+            long now = System.currentTimeMillis();
+            long smAge = now - snap.updatedAtMs;
+            if (smAge > Math.max(0L, maxSmAgeForWriteMs)) {
+                // Input is stale → do not overwrite previous good image
+                alerts.raise("INVERTER_FEEDER_STALE_INPUT",
+                        "Meter input stale: " + smAge + " ms (>" + maxSmAgeForWriteMs + " ms)",
+                        AlertService.Severity.ERROR);
+                return;
+            } else {
+                alerts.resolve("INVERTER_FEEDER_STALE_INPUT");
+            }
+
             // 2) Desired compensation (kW), already honoring overrideEnabled flag
             double deltaKw = loadOverride.getCurrentDeltaKw();
 
             // 3) Build outgoing register image (Acrel-only)
             short[] frame = powerControl.prepareOutputWords(snap, deltaKw);
 
-            // 4) Publish: write the ENTIRE frame so high registers (e.g., 356..362) are set
+            // 4) Publish: write both 04 & 03 and cover high registers
+            int writeCount = Math.max(initRegisters, frame.length);
             synchronized (lock) {
                 if (image == null) return; // could be closed concurrently
-                for (int i = 0; i < frame.length; i++) {
-                    image.setInputRegister(i, frame[i]);    // 04
-                    image.setHoldingRegister(i, frame[i]);   // 03  <-- NEW
+                for (int i = 0; i < writeCount; i++) {
+                    short v = (i < frame.length) ? frame[i] : 0;
+                    image.setInputRegister(i, v);    // 04
+                    image.setHoldingRegister(i, v);  // 03
                 }
-                lastWriteMs = System.currentTimeMillis();
+                lastWriteMs = now;
             }
 
             // expose for UI
             outputData = frame;
 
+            // success → resolve write alerts
+            alerts.resolve("INVERTER_WRITE_FAIL");
+            alerts.resolve("INVERTER_OUTPUT_STALE");
+
             if (log.isDebugEnabled()) {
                 log.debug("Compensate={} kW; wrote {} regs (min..max={}..{})",
-                        deltaKw, frame.length, 0, frame.length - 1);
+                        deltaKw, writeCount, 0, writeCount - 1);
                 if (log.isTraceEnabled()) {
-                    // guards for nulls and length
-                    if (snap != null && snap.data != null) {
+                    if (snap.data != null) {
                         int lo = Math.min(97, snap.data.length);
                         int hi = Math.min(123, snap.data.length);
                         if (hi > lo) {
@@ -194,7 +216,6 @@ public class ModbusInverterFeeder {
                     } else {
                         log.trace("SM snapshot: <null>");
                     }
-
                     int lo2 = Math.min(97, frame.length);
                     int hi2 = Math.min(123, frame.length);
                     if (hi2 > lo2) {
@@ -215,11 +236,24 @@ public class ModbusInverterFeeder {
         }
     }
 
+    // Separate watchdog to avoid false positives on boot (lastWriteMs==0)
+    private void watchOutputStaleness() {
+        if (!up || image == null) return;
+        long now = System.currentTimeMillis();
+        long age = (lastWriteMs == 0L) ? 0L : (now - lastWriteMs);
+        if (lastWriteMs == 0L) return; // don’t alert until the first successful publish
+        if (age > Math.max(0L, outStaleMs)) {
+            alerts.raise("INVERTER_OUTPUT_STALE",
+                    "No inverter feed update for " + age + " ms",
+                    AlertService.Severity.ERROR);
+        } else {
+            alerts.resolve("INVERTER_OUTPUT_STALE");
+        }
+    }
+
     // ===== Helpers =====
 
-    /**
-     * On Linux we can check /dev/... existence. On Windows (COMx) just return true.
-     */
+    /** On Linux we can check /dev/... existence. On Windows (COMx) just return true. */
     private boolean devicePresent() {
         if (port == null || !port.startsWith("/")) return true;
         try {

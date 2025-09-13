@@ -49,15 +49,15 @@ public class ModbusSmReader {
     @Value("${serial.input.warmupMs:2000}")           private int warmupMs;
     @Value("${serial.input.timeoutsBeforeReopen:3}")  private int timeoutsBeforeReopen;
 
+    // stale-frame watchdog tuning
+    @Value("${serial.input.meterStaleMs:30000}")      private long meterStaleMs;
+    @Value("${serial.input.staleAlertMinPeriodMs:10000}") private long staleAlertMinPeriodMs; // throttle raises
+
+    // reopen if too many windows fail in one pass
+    @Value("${serial.input.maxWindowErrorsBeforeReopen:3}") private int maxWindowErrorsBeforeReopen;
+
     // Constant
     private static final int RAW_LEN = 400;
-
-    private static final int ACREL_BLOCK1_START = 97;
-    private static final int ACREL_BLOCK1_LEN   = 26;   // 97..122
-
-    private static final int ACREL_BLOCK2_START = 356;
-    private static final int ACREL_BLOCK2_LEN   = 8;    // 356..363
-
     private static final int IMAGE_MAX = 399; // mirror 0..399
     private static final int BLOCK_LEN = 60;  // safe per-request chunk (<=125)
 
@@ -75,6 +75,9 @@ public class ModbusSmReader {
     private volatile boolean stopping = false;
     private volatile long lastOpenAt = 0L;
     private volatile int consecutiveTimeouts = 0;
+
+    // local throttle for METER_STALE raises
+    private volatile long lastStaleAlertAt = 0L;
 
     public ModbusSmReader(ScheduledExecutorService scheduler, AlertService alerts) {
         this.scheduler = scheduler;
@@ -98,14 +101,48 @@ public class ModbusSmReader {
 
     // ---- Read loop ----
     private void readOnceSafe() {
+        if (!devicePresent()) {
+            alerts.raise("METER_DISCONNECTED", "Serial device missing: " + port, AlertService.Severity.ERROR);
+            closeQuietly();
+            sleepQuiet(reopenBackoffMs);
+            return;
+        }
+
         try {
+            // ---- stale-frame watchdog (no extra scheduler needed) ----
+            long ts = latestSnapshotSM.updatedAtMs;
+            if (ts != 0) {
+                long now = System.currentTimeMillis();
+                long age = now - ts;
+                boolean pastWarmup = (now - lastOpenAt) > Math.max(0, warmupMs);
+                if (pastWarmup && age > meterStaleMs) {
+                    if ((now - lastStaleAlertAt) > Math.max(1000L, staleAlertMinPeriodMs)) { // throttle
+                        alerts.raise("METER_STALE",
+                                "Last good meter frame " + age + " ms ago",
+                                AlertService.Severity.ERROR);
+                        lastStaleAlertAt = now;
+                    }
+                } else if (age <= meterStaleMs) {
+                    alerts.resolve("METER_STALE");
+                }
+            }
+
             ensureOpen();
-            short[] img = readAcrelFrame();
+            short[] img = readAcrelFrame(); // may throw RuntimeException if too many window errors
+
+            // SUCCESS
             latestSnapshotSM = new SmSnapshot(img, System.currentTimeMillis());
             consecutiveTimeouts = 0;
-            alerts.resolve("METER_DISCONNECTED");
-            alerts.resolve("MODBUS_UNCAUGHT");
+            if (!stopping) {
+                alerts.resolve("METER_DISCONNECTED");
+                alerts.resolve("MODBUS_UNCAUGHT");
+                alerts.resolve("METER_STALE");
+            }
+            // reset local stale throttle on success
+            lastStaleAlertAt = 0L;
+
         } catch (ModbusTransportException e) {
+            // Common path when the device is waking up: read/write timeouts
             if (isTimeout(e)) {
                 consecutiveTimeouts++;
                 long sinceOpen = System.currentTimeMillis() - lastOpenAt;
@@ -126,16 +163,23 @@ public class ModbusSmReader {
             if (!stopping) alerts.raise("METER_DISCONNECTED", "SM read/open failed: " + e, AlertService.Severity.ERROR);
             closeQuietly();
             sleepQuiet(reopenBackoffMs);
+
         } catch (Throwable e) {
+            // non-transport errors OR “too many window errors” from readAcrelFrame
             if (!stopping) alerts.raise("METER_DISCONNECTED", "SM read/open failed: " + e, AlertService.Severity.ERROR);
             closeQuietly();
             sleepQuiet(reopenBackoffMs);
         }
     }
 
+    /**
+     * Mirror 0..399 in 60-reg windows. Skip isolated bad windows,
+     * but if too many windows fail in one pass → force reopen.
+     */
     private short[] readAcrelFrame() {
-        short[] out = new short[RAW_LEN]; // RAW_LEN is 400 in your code
+        short[] out = new short[RAW_LEN]; // RAW_LEN is 400
 
+        int failed = 0;
         for (int start = 0; start <= IMAGE_MAX; start += BLOCK_LEN) {
             int len = Math.min(BLOCK_LEN, IMAGE_MAX - start + 1);
             try {
@@ -146,12 +190,29 @@ public class ModbusSmReader {
                     int copy = Math.min(len, data.length);
                     System.arraycopy(data, 0, out, start, copy);
                 } // if exception: meter might not implement this window → just skip
+                else {
+                    failed++;
+                    if (log.isDebugEnabled()) {
+                        log.debug("modbus_exception window {}..{} code={} msg={}",
+                                start, start + len - 1, r.getExceptionCode(), r.getExceptionMessage());
+                    }
+                }
             } catch (ModbusTransportException ex) {
                 // Skip this window and continue with the next; don't break the whole image
+                failed++;
                 if (log.isTraceEnabled()) log.trace("skip window {}..{}: {}", start, start + len - 1, ex.toString());
             } catch (Exception ex) {
+                failed++;
                 if (log.isDebugEnabled()) log.debug("unexpected window error @{}: {}", start, ex.toString());
             }
+        }
+
+        if (failed > 0) {
+            log.warn("acrel_read_partial: {} windows failed in this pass", failed);
+        }
+        if (failed >= Math.max(1, maxWindowErrorsBeforeReopen)) {
+            // force outer catch → reopen; don’t publish a “holey” image
+            throw new RuntimeException("too many window errors: " + failed);
         }
 
         if (log.isDebugEnabled()) {
@@ -161,13 +222,6 @@ public class ModbusSmReader {
     }
 
     // ---- Helpers ----
-    private static void copyBlock(short[] dest, int startAddr, short[] data) {
-        if (dest == null || data == null) return;
-        int max = Math.min(dest.length - startAddr, data.length);
-        if (max <= 0) return;
-        System.arraycopy(data, 0, dest, startAddr, max);
-    }
-
     private boolean isTimeout(Throwable e) {
         for (Throwable c = e; c != null; c = c.getCause()) {
             if (c instanceof TimeoutException) return true;
@@ -205,6 +259,16 @@ public class ModbusSmReader {
                     log.info("meter_port_closed port={}", port);
                 }
             }
+        }
+    }
+
+    private boolean devicePresent() {
+        if (port == null || !port.startsWith("/")) return true; // Windows COMx
+        try {
+            java.nio.file.Path p = java.nio.file.Path.of(port).toRealPath();
+            return java.nio.file.Files.isReadable(p);
+        } catch (Exception e) {
+            return false;
         }
     }
 
