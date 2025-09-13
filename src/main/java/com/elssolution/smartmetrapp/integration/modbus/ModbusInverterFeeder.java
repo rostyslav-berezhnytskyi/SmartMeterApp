@@ -64,6 +64,13 @@ public class ModbusInverterFeeder {
     @Value("${serial.output.outStaleMs:30000}")
     private long outStaleMs;
 
+    @Value("${serial.output.deferOpenUntilFirstFrame:true}")
+    private boolean deferOpenUntilFirstFrame;
+
+    @Value("${serial.output.republishOnStale:true}")
+    private boolean republishOnStale;
+
+
     // ===== Runtime state =====
     private final Object lock = new Object();
     private volatile BasicProcessImage image;     // current process image
@@ -87,6 +94,7 @@ public class ModbusInverterFeeder {
     // ===== Open/Close =====
 
     /** Ensure the Modbus slave is up; if device vanishes, close and mark down. */
+    // ===== Open/Close =====
     private void ensureOpen() {
         if (up && !devicePresent()) {
             log.warn("Serial device {} disappeared; closing inverter slave", port);
@@ -96,16 +104,25 @@ public class ModbusInverterFeeder {
         }
         if (up) return;
 
+        // avoid opening until we have a fresh frame (prevents zero image)
+        if (deferOpenUntilFirstFrame && !hasFreshFrame(maxSmAgeForWriteMs)) {
+            alerts.raise("INVERTER_FEEDER_WAITING_FOR_METER", "Waiting for first meter frame…",
+                    AlertService.Severity.WARN);
+            return;
+        } else {
+            alerts.resolve("INVERTER_FEEDER_WAITING_FOR_METER");
+        }
+
         try {
             SerialPortWrapper wrapper = new SerialPortWrapperImpl(port, baudRate);
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
             BasicProcessImage newImage = new BasicProcessImage(slaveId);
 
-            // Pre-zero a safe range (both 04 & 03, some devices read either)
+            // Keep optional pre-zero, but default is 0 (disabled)
             if (initRegisters > 0) {
                 for (int i = 0; i < initRegisters; i++) {
-                    newImage.setInputRegister(i, (short) 0);   // function 04
-                    newImage.setHoldingRegister(i, (short) 0); // function 03
+                    newImage.setInputRegister(i, (short) 0);   // 04
+                    newImage.setHoldingRegister(i, (short) 0); // 03
                 }
             }
 
@@ -119,6 +136,10 @@ public class ModbusInverterFeeder {
             }
             log.info("Inverter-slave opened: port={} baud={} initRegisters={}", port, baudRate, initRegisters);
             alerts.resolve("INVERTER_RTU_DOWN");
+
+            // NEW: publish immediately after open (no zero-frame window)
+            initialPublishAfterOpen();
+
         } catch (ModbusInitException e) {
             alerts.raise("INVERTER_RTU_DOWN",
                     "Inverter-slave open failed (ModbusInit): " + e.getMessage(),
@@ -129,6 +150,7 @@ public class ModbusInverterFeeder {
                     AlertService.Severity.ERROR);
         }
     }
+
 
     /** Stop the slave and clear internal state. Safe to call multiple times. */
     private void closeQuietly() {
@@ -147,17 +169,21 @@ public class ModbusInverterFeeder {
     // ===== Main loop =====
 
     /** Build one frame and publish it to the Modbus slave. */
+    // ===== Main loop =====
     private void tick() {
         try {
             if (!up || image == null || !devicePresent()) return;
 
-            // 1) Meter snapshot (raw Acrel registers)
+            // 1) latest meter snapshot
             SmSnapshot snap = smReader.getLatestSnapshotSM();
 
-            // Gate on availability: don’t overwrite the image before first good meter frame
+            // No first frame yet → keep last frame alive if any
             if (snap == null || snap.updatedAtMs == 0L) {
                 alerts.raise("INVERTER_FEEDER_WAITING_FOR_METER", "Waiting for first meter frame…",
                         AlertService.Severity.WARN);
+                if (republishOnStale && outputData != null) {
+                    publishFullFrame(outputData);
+                }
                 return;
             } else {
                 alerts.resolve("INVERTER_FEEDER_WAITING_FOR_METER");
@@ -165,36 +191,28 @@ public class ModbusInverterFeeder {
 
             long now = System.currentTimeMillis();
             long smAge = now - snap.updatedAtMs;
+
+            // 2) If SM input is stale → re-publish last good frame (do NOT send zeros)
             if (smAge > Math.max(0L, maxSmAgeForWriteMs)) {
-                // Input is stale → do not overwrite previous good image
                 alerts.raise("INVERTER_FEEDER_STALE_INPUT",
                         "Meter input stale: " + smAge + " ms (>" + maxSmAgeForWriteMs + " ms)",
                         AlertService.Severity.ERROR);
-                return;
+                if (republishOnStale && outputData != null) {
+                    publishFullFrame(outputData);
+                    return;
+                } else {
+                    return; // image keeps previous contents
+                }
             } else {
                 alerts.resolve("INVERTER_FEEDER_STALE_INPUT");
             }
 
-            // 2) Desired compensation (kW), already honoring overrideEnabled flag
+            // 3) Build full outgoing image (pass-through when override OFF)
             double deltaKw = loadOverride.getCurrentDeltaKw();
-
-            // 3) Build outgoing register image (Acrel-only)
             short[] frame = powerControl.prepareOutputWords(snap, deltaKw);
 
-            // 4) Publish: write both 04 & 03 and cover high registers
-            int writeCount = Math.max(initRegisters, frame.length);
-            synchronized (lock) {
-                if (image == null) return; // could be closed concurrently
-                for (int i = 0; i < writeCount; i++) {
-                    short v = (i < frame.length) ? frame[i] : 0;
-                    image.setInputRegister(i, v);    // 04
-                    image.setHoldingRegister(i, v);  // 03
-                }
-                lastWriteMs = now;
-            }
-
-            // expose for UI
-            outputData = frame;
+            // 4) Publish WHOLE FRAME (04 & 03)
+            publishFullFrame(frame);
 
             // success → resolve write alerts
             alerts.resolve("INVERTER_WRITE_FAIL");
@@ -202,46 +220,24 @@ public class ModbusInverterFeeder {
 
             if (log.isDebugEnabled()) {
                 log.debug("Compensate={} kW; wrote {} regs (min..max={}..{})",
-                        deltaKw, writeCount, 0, writeCount - 1);
-                if (log.isTraceEnabled()) {
-                    if (snap.data != null) {
-                        int lo = Math.min(97, snap.data.length);
-                        int hi = Math.min(123, snap.data.length);
-                        if (hi > lo) {
-                            log.trace("SM snapshot slice(97..123): {}",
-                                    Arrays.toString(Arrays.copyOfRange(snap.data, lo, hi)));
-                        } else {
-                            log.trace("SM snapshot len={}", snap.data.length);
-                        }
-                    } else {
-                        log.trace("SM snapshot: <null>");
-                    }
-                    int lo2 = Math.min(97, frame.length);
-                    int hi2 = Math.min(123, frame.length);
-                    if (hi2 > lo2) {
-                        log.trace("Output slice(97..123): {}",
-                                Arrays.toString(Arrays.copyOfRange(frame, lo2, hi2)));
-                    } else {
-                        log.trace("Output frame len={}", frame.length);
-                    }
-                }
+                        deltaKw, Math.max(initRegisters, frame.length), 0, Math.max(initRegisters, frame.length) - 1);
             }
 
         } catch (Exception e) {
             alerts.raise("INVERTER_WRITE_FAIL",
                     "Inverter-slave write failed: " + e.getMessage(),
                     AlertService.Severity.WARN);
-            // Most common: unplug/reset; the opener will retry.
             closeQuietly();
         }
     }
+
 
     // Separate watchdog to avoid false positives on boot (lastWriteMs==0)
     private void watchOutputStaleness() {
         if (!up || image == null) return;
         long now = System.currentTimeMillis();
-        long age = (lastWriteMs == 0L) ? 0L : (now - lastWriteMs);
-        if (lastWriteMs == 0L) return; // don’t alert until the first successful publish
+        if (lastWriteMs == 0L) return;
+        long age = now - lastWriteMs;
         if (age > Math.max(0L, outStaleMs)) {
             alerts.raise("INVERTER_OUTPUT_STALE",
                     "No inverter feed update for " + age + " ms",
@@ -263,4 +259,49 @@ public class ModbusInverterFeeder {
             return false;
         }
     }
+
+    // do we have a fresh meter frame? ===
+    private boolean hasFreshFrame(long maxAgeMs) {
+        SmSnapshot s = smReader.getLatestSnapshotSM();
+        if (s == null || s.updatedAtMs == 0L) return false;
+        return (System.currentTimeMillis() - s.updatedAtMs) <= Math.max(0L, maxSmAgeForWriteMs);
+    }
+
+    // publish immediately after open using last output or a fresh build
+    private void initialPublishAfterOpen() {
+        try {
+            short[] frame = outputData; // last good
+            if (frame == null) {
+                SmSnapshot snap = smReader.getLatestSnapshotSM();
+                double deltaKw = loadOverride.getCurrentDeltaKw();
+                frame = powerControl.prepareOutputWords(snap, deltaKw);
+            }
+            if (frame != null) {
+                publishFullFrame(frame);
+                alerts.resolve("INVERTER_OUTPUT_STALE");
+            }
+        } catch (Exception e) {
+            alerts.raise("INVERTER_WRITE_FAIL",
+                    "Inverter-slave initial publish failed: " + e.getMessage(),
+                    AlertService.Severity.WARN);
+            closeQuietly();
+        }
+    }
+
+    // single place that writes the WHOLE frame to 04 & 03
+    private void publishFullFrame(short[] frame) {
+        int writeCount = Math.max(initRegisters, frame.length);
+        synchronized (lock) {
+            if (image == null) return;
+            for (int i = 0; i < writeCount; i++) {
+                short v = (i < frame.length) ? frame[i] : 0;
+                image.setInputRegister(i, v);   // 04
+                image.setHoldingRegister(i, v); // 03
+            }
+            lastWriteMs = System.currentTimeMillis();
+        }
+        outputData = frame;
+    }
+
+
 }

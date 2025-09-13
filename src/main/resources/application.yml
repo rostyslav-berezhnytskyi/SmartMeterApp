@@ -22,6 +22,8 @@ serial:
     initRegisters: ${SERIAL_OUTPUT_INIT_REGS:400}
     maxSmAgeForWriteMs: 60000      # don’t publish if the meter snapshot is older
     outStaleMs: 30000              # alert if we haven’t written in this long
+    deferOpenUntilFirstFrame: true   # don’t open slave until first fresh SM frame
+    republishOnStale: true           # keep last good frame flowing when SM pauses
 
 devtools:
   restart:
