@@ -263,9 +263,9 @@ public class ModbusInverterFeeder {
     private void publishFullFrame(short[] frame) {
         AtomicSnapshotImage img = image;
         if (img == null) return;
-        img.publish(frame);                     // <<< atomic pointer swap, no tearing >>>
+        img.publish(frame);
         lastWriteMs = System.currentTimeMillis();
-        outputData  = frame;
+        outputData  = (frame != null) ? frame.clone() : null; // avoid future accidental mutation
     }
 
 

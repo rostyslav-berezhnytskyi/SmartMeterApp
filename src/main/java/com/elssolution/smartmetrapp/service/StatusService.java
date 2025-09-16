@@ -44,7 +44,7 @@ public class StatusService {
     @Value("${smartmetr.scale.ct:1.0}") private double ct;
 
     // Summary log period
-    private final int summaryEverySec = 30;
+    private final int summaryEverySec = 5;
 
     @PostConstruct
     void startSummaryLogger() {
@@ -122,23 +122,66 @@ public class StatusService {
     }
 
     // ---------------------- Log summary ----------------------
+    private static String fmt0(int v) { return Integer.toString(v); }
+    private static String fmtPF(double pf) {
+        if (Double.isNaN(pf)) return "-";
+        // clamp and format to 2 decimals
+        pf = Math.max(-1.0, Math.min(1.0, pf));
+        return DF2.format(pf);
+    }
+
+    private record Est(int p1W, int p2W, int p3W, int s1VA, int s2VA, int s3VA, int sTotVA, double pfTot) {}
+
+    private static Est estimatePhasePowers(float v1, float i1, float v2, float i2, float v3, float i3, int pTotW) {
+        double s1=v1*i1, s2=v2*i2, s3=v3*i3, sTot = s1+s2+s3;
+        if (sTot < 1.0) return new Est(0,0,0,(int)Math.round(s1),(int)Math.round(s2),(int)Math.round(s3), (int)Math.round(sTot), Double.NaN);
+
+        double pfMag = Math.min(1.0, Math.abs(pTotW) / sTot);
+        double pf    = Math.copySign(pfMag, pTotW);  // keep direction
+
+        int p1 = (int)Math.round(s1 * pf);
+        int p2 = (int)Math.round(s2 * pf);
+        int p3 = (int)Math.round(s3 * pf);
+        return new Est(p1,p2,p3,(int)Math.round(s1),(int)Math.round(s2),(int)Math.round(s3),(int)Math.round(sTot), pf);
+    }
+
 
     private void logSummarySafe() {
         try {
             StatusView v = buildStatusView();
+
+            // Estimate per-phase powers for SM (meter snapshot)
+            Est smEst = estimatePhasePowers(
+                    v.smV1, v.smI1, v.smV2, v.smI2, v.smV3, v.smI3, v.smPTotalW);
+
+            // Estimate per-phase powers for Out using SM voltages (we only have Out currents)
+            Est outEst = estimatePhasePowers(
+                    v.smV1, v.outI1, v.smV2, v.outI2, v.smV3, v.outI3, v.smPTotalW);
+
+            int targetW = (int)Math.round(loadOverride.getCurrentDeltaKw() * 1000.0);
+            int eW = v.smPTotalW - targetW;  // (remember: + = export), targetW uses same sign as bias
+
             log.info(
                     "Status: gridImport={}kW (psum={}kW, minImport={}kW) → compensate={}kW; " +
-                            "SM: V1={}V I1={}A, V2={}V I2={}A, V3={}V I3={}A, Ptot={}W (age {}); " +
-                            "Out: I1={}A I2={}A I3={}A, Ptot={}W (age {})",
+                            "SM: V1={}V I1={}A, V2={}V I2={}A, V3={}V I3={}A, " +
+                            "S≈[{};{};{}]VA ΣS≈{}VA PF≈{} P≈[{};{};{}]W, Ptot={}W (age {}); " +
+                            "Out: I1={}A I2={}A I3={}A, P*≈[{};{};{}]W, PtotPub={}W (age {}); " +
+                            "ctrlErr={}W",
                     fmt(v.gridImportKw), fmt(v.gridRawPsumKw), fmt(v.minImportKw), fmt(v.compensationKw),
+
                     fmt(v.smV1), fmt(v.smI1), fmt(v.smV2), fmt(v.smI2), fmt(v.smV3), fmt(v.smI3),
-                    v.smPTotalW, v.smAgeHuman,
-                    fmt(v.outI1), fmt(v.outI2), fmt(v.outI3), v.outPTotalW, v.outAgeHuman
+                    fmt0(smEst.s1VA), fmt0(smEst.s2VA), fmt0(smEst.s3VA), fmt0(smEst.sTotVA), fmtPF(smEst.pfTot),
+                    fmt0(smEst.p1W), fmt0(smEst.p2W), fmt0(smEst.p3W), v.smPTotalW, v.smAgeHuman,
+
+                    fmt(v.outI1), fmt(v.outI2), fmt(v.outI3),
+                    fmt0(outEst.p1W), fmt0(outEst.p2W), fmt0(outEst.p3W), v.outPTotalW, v.outAgeHuman, eW
             );
+
         } catch (Exception e) {
             log.warn("status_summary_failed: {}", e.getMessage());
         }
     }
+
 
     // ---------------------- Acrel decode helpers ----------------------
 

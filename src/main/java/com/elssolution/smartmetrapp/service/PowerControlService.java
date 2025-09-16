@@ -96,23 +96,21 @@ public class PowerControlService {
         int alive = (a1?1:0) + (a2?1:0) + (a3?1:0);
         if (alive == 0) return out;
 
+        // Distribute the same offset across alive phases (equal split)
         double perAlive = dW / alive;
 
-        // IMPORTANT: do NOT edit currents (let inverter lock to P)
-        if (a1) {
-            if (editCurrents) /*bumpPhaseCurrent(out, REG_I1, ...);*/  // keep disabled by default
-                writeI32be(out, REG_P1, toRawPower(p1W + perAlive, PT, CT));
-        }
-        if (a2) {
-            if (editCurrents) /*bumpPhaseCurrent(out, REG_I2, ...);*/
-                writeI32be(out, REG_P2, toRawPower(p2W + perAlive, PT, CT));
-        }
-        if (a3) {
-            if (editCurrents) /*bumpPhaseCurrent(out, REG_I3, ...);*/
-                writeI32be(out, REG_P3, toRawPower(p3W + perAlive, PT, CT));
-        }
+// Always write per-phase powers; do NOT change currents
+        if (a1) { writeI32be(out, REG_P1, toRawPower(p1W + perAlive, PT, CT)); }
+        if (a2) { writeI32be(out, REG_P2, toRawPower(p2W + perAlive, PT, CT)); }
+        if (a3) { writeI32be(out, REG_P3, toRawPower(p3W + perAlive, PT, CT)); }
 
-        writeI32be(out, REG_PTOT, toRawPower(pTotPublishedW, PT, CT));
+// Small bias near zero to avoid dithering (Acrel: import is NEGATIVE; flip if yours is opposite)
+        final double biasMinW = 50; // tune 20..100 W
+        double pubTot = pTotPublishedW;
+        if (Math.abs(pubTot) < biasMinW) pubTot = -biasMinW;
+
+        writeI32be(out, REG_PTOT, toRawPower(pubTot, PT, CT));
+
 
         return out;
     }
