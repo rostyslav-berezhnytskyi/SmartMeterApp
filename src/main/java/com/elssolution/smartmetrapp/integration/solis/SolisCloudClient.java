@@ -29,18 +29,36 @@ import java.util.concurrent.ThreadLocalRandom;
 public class SolisCloudClient {
 
     // ----- Config -----
-    @Value("${solis.api.id}")     private String apiId;
-    @Value("${solis.api.secret}") private String apiSecret;
-    @Value("${solis.api.uri}")    private String solisBaseUri; // e.g. https://www.soliscloud.com
-    @Value("${solis.api.sn}")     private String inverterSn;
+    @Value("${solis.api.id}")
+    private String apiId;
+    @Value("${solis.api.secret}")
+    private String apiSecret;
+    @Value("${solis.api.uri}")
+    private String solisBaseUri; // e.g. https://www.soliscloud.com
+    @Value("${solis.api.sn}")
+    private String inverterSn;
 
-    /** Per-request timeout (ms). */
+    /**
+     * Per-request timeout (ms).
+     */
     @Value("${solis.http.requestTimeoutMs:6000}")
     private int requestTimeoutMs;
 
-    /** If server/client time drift exceeds this, raise SOLIS_CLOCK_SKEW (ms). */
+    /**
+     * If server/client time drift exceeds this, raise SOLIS_CLOCK_SKEW (ms).
+     */
     @Value("${solis.maxClockSkewMs:90000}")
     private long maxClockSkewMs;
+
+    /**
+     * Grace period before raising SOLIS_DOWN for transient errors (ms).
+     */
+    @Value("${solis.http.graceMs:60000}")
+    private long transientErrorGraceMs;
+
+    // Track a transient-outage episode
+    private volatile long firstTransientErrorAt = 0L;
+    private volatile boolean solisDownRaised = false;
 
     // ----- HTTP + JSON -----
     private final HttpClient httpClient = HttpClient.newBuilder()
@@ -57,6 +75,9 @@ public class SolisCloudClient {
 
     // minimal retry/backoff (+ jitter)
     private static final int[] RETRY_DELAYS_MS = {500, 1000};
+
+    // Treat "near zero" PV as missing; Solis sometimes reports 0.0 on one field while others are valid.
+    private static final double PV_MIN_VALID_KW = 0.05;   // 50 W
 
     public SolisCloudClient(AlertService alerts) {
         this.alerts = alerts;
@@ -98,14 +119,14 @@ public class SolisCloudClient {
 
             // PV power (kW): prefer pac, else dcPac, else powTotal/sum(pow1..32), else dcAcPower(W)
             Double pacKw = nodeNum(d, "pac");
-            Double pvKw  = choosePvKw(d, pacKw);
+            Double pvKw = choosePvKw(d, pacKw);
 
             // Site load (kW): physical balance vs API fields (pick close one)
             Double familyApiKw = readWithUnitKw(d, "familyLoadPower", "familyLoadPowerStr");
-            Double totalApiKw  = readWithUnitKw(d, "totalLoadPower",  "totalLoadPowerStr");
-            double calcLoadKw  = (pvKw != null ? pvKw : 0.0)
+            Double totalApiKw = readWithUnitKw(d, "totalLoadPower", "totalLoadPowerStr");
+            double calcLoadKw = (pvKw != null ? pvKw : 0.0)
                     + (psumKw < 0 ? -psumKw : 0.0)
-                    - (psumKw > 0 ?  psumKw : 0.0);
+                    - (psumKw > 0 ? psumKw : 0.0);
             Double familyLoadKw = pickPlausibleLoad(familyApiKw, totalApiKw, calcLoadKw);
 
             Integer state = d.path("state").isMissingNode() ? null : d.path("state").asInt();
@@ -115,8 +136,8 @@ public class SolisCloudClient {
                 log.debug("Solis rich: psum={}kW, pac={}kW, pv={}kW, load={}kW, state={}, warn={}",
                         psumKw, pacKw, pvKw, familyLoadKw, state, warningInfoData);
                 log.debug("PV choose detail: pac={} dcPac={} sumPow={} dcAc={} → pv={}",
-                        pacKw, readWithUnitKw(d,"dcPac","dcPacStr"), sumPowStringsKw(d),
-                        nodeNum(d,"dcAcPower"), pvKw);
+                        pacKw, readWithUnitKw(d, "dcPac", "dcPacStr"), sumPowStringsKw(d),
+                        nodeNum(d, "dcAcPower"), pvKw);
             }
 
             alerts.resolve("SOLIS_DOWN");
@@ -183,17 +204,27 @@ public class SolisCloudClient {
                     } catch (Exception ignore) { /* header absent or unparsable */ }
                 });
 
-                if (sc == 200) return Optional.ofNullable(resp.body());
+                if (sc == 200) {
+                    // success → if we had a SOLIS_DOWN episode, resolve it now
+                    if (solisDownRaised) alerts.resolve("SOLIS_DOWN");
+                    resetTransientState();
+                    return Optional.ofNullable(resp.body());
+                }
 
                 // classify
                 if (sc == 401 || sc == 403) {
                     alerts.raise("SOLIS_AUTH", "HTTP " + sc + " — check API id/secret/Date", AlertService.Severity.ERROR);
+                    // auth is not transient; close any transient episode
+                    if (solisDownRaised) alerts.resolve("SOLIS_DOWN");
+                    resetTransientState();
                 } else if (sc == 429) {
                     alerts.raise("SOLIS_RATE_LIMIT", "HTTP 429 — rate limited by Solis", AlertService.Severity.WARN);
-                } else if (sc >= 500 && sc < 600) {
-                    alerts.raise("SOLIS_DOWN", "HTTP " + sc + " — server error", AlertService.Severity.WARN);
+                    maybeRaiseTransient("HTTP 429 — rate limited by Solis");
+                } else if (isTransientStatus(sc)) {
+                    maybeRaiseTransient("HTTP " + sc + " — server error");
                 } else {
-                    alerts.raise("SOLIS_DOWN", "HTTP " + sc + " — " + truncate(resp.body(), 240), AlertService.Severity.WARN);
+                    // treat odd 4xx as transient unless you want stricter behavior
+                    maybeRaiseTransient("HTTP " + sc + " — " + truncate(resp.body(), 240));
                 }
 
                 // retry policy
@@ -213,7 +244,7 @@ public class SolisCloudClient {
 
             } catch (java.net.http.HttpTimeoutException e) {
                 // falls under request .timeout()
-                alerts.raise("SOLIS_DOWN", "HTTP timeout: " + e.getMessage(), AlertService.Severity.WARN);
+                maybeRaiseTransient("HTTP timeout: " + e.getMessage());
                 if (attempt < RETRY_DELAYS_MS.length) {
                     sleepQuiet(RETRY_DELAYS_MS[attempt]);
                     continue;
@@ -221,7 +252,11 @@ public class SolisCloudClient {
                 return Optional.empty();
 
             } catch (java.io.IOException e) {
-                alerts.raise("SOLIS_DOWN", "I/O error: " + e.getMessage(), AlertService.Severity.WARN);
+                String m = e.getMessage();
+                if (m != null && m.contains("header parser received no bytes")) {
+                    m = "Remote closed connection before replying (transient).";
+                }
+                maybeRaiseTransient("I/O error: " + m);
                 if (attempt < RETRY_DELAYS_MS.length) {
                     sleepQuiet(RETRY_DELAYS_MS[attempt]);
                     continue;
@@ -234,6 +269,9 @@ public class SolisCloudClient {
 
             } catch (Exception fatal) {
                 alerts.raise("SOLIS_DOWN", "Fatal error: " + fatal.getMessage(), AlertService.Severity.ERROR);
+                // fatal: end transient episode if any
+                if (solisDownRaised) alerts.resolve("SOLIS_DOWN");
+                resetTransientState();
                 return Optional.empty();
             }
         }
@@ -244,10 +282,17 @@ public class SolisCloudClient {
 
     private static boolean isNumericText(String s) {
         if (s == null || s.isBlank()) return false;
-        try { Double.parseDouble(s.trim()); return true; } catch (Exception e) { return false; }
+        try {
+            Double.parseDouble(s.trim());
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
-    /** Reads a numeric field; handles numbers-as-strings too. */
+    /**
+     * Reads a numeric field; handles numbers-as-strings too.
+     */
     private static Double nodeNum(JsonNode obj, String field) {
         JsonNode n = obj.path(field);
         if (n.isNumber()) return n.asDouble();
@@ -273,57 +318,100 @@ public class SolisCloudClient {
         boolean any = false;
         for (int i = 1; i <= 32; i++) {
             Double a = nodeNum(d, "pow" + i);
-            if (a != null) { sumW += a; any = true; continue; }
+            if (a != null) {
+                sumW += a;
+                any = true;
+                continue;
+            }
             Double b = nodeNum(d, "Pow" + i);
-            if (b != null) { sumW += b; any = true; }
+            if (b != null) {
+                sumW += b;
+                any = true;
+            }
         }
         return any ? sumW / 1000.0 : null;
     }
 
-    // Treat "near zero" PV as missing; Solis sometimes reports 0.0 on one field while others are valid.
-    private static final double PV_MIN_VALID_KW = 0.05;   // 50 W
+    private void resetTransientState() {
+        firstTransientErrorAt = 0L;
+        solisDownRaised = false;
+    }
 
-    /** Choose the best PV power (kW). Prefer pac; otherwise dcPac (unit-aware); then powTotal/sum(pow1..32); then dcAcPower (W). */
+    private boolean isTransientStatus(int sc) {
+        return sc == 429 || (sc >= 500 && sc < 600);
+    }
+
+    private void maybeRaiseTransient(String msg) {
+        long now = System.currentTimeMillis();
+        if (firstTransientErrorAt == 0L) firstTransientErrorAt = now;
+        long age = now - firstTransientErrorAt;
+        if (age >= Math.max(0, transientErrorGraceMs)) {
+            // Only *start* the episode once; AlertService will coalesce repeated raises
+            if (!solisDownRaised) {
+                alerts.raise("SOLIS_DOWN", msg + " (grace exceeded " + transientErrorGraceMs + " ms)", AlertService.Severity.WARN);
+                solisDownRaised = true;
+            } else {
+                // refresh episode (noisy sinks should throttle themselves)
+                alerts.raise("SOLIS_DOWN", msg, AlertService.Severity.WARN);
+            }
+        } else {
+            // Before grace ends: just log
+            log.warn("Solis transient error ({} ms into grace): {}", age, msg);
+        }
+    }
+
+
+    /**
+     * Choose the best PV power (kW). Prefer pac; otherwise dcPac (unit-aware); then powTotal/sum(pow1..32); then dcAcPower (W).
+     */
     private static Double choosePvKw(JsonNode d, Double pacKw) {
-        Double dcPacKw    = readWithUnitKw(d, "dcPac", "dcPacStr");
-        Double powSumKw   = sumPowStringsKw(d);
+        Double dcPacKw = readWithUnitKw(d, "dcPac", "dcPacStr");
+        Double powSumKw = sumPowStringsKw(d);
         Double dcAcPowerW = nodeNum(d, "dcAcPower");
-        Double dcAcKw     = (dcAcPowerW != null ? dcAcPowerW / 1000.0 : null);
+        Double dcAcKw = (dcAcPowerW != null ? dcAcPowerW / 1000.0 : null);
 
-        if (pacKw   != null && pacKw   > PV_MIN_VALID_KW) return pacKw;
+        if (pacKw != null && pacKw > PV_MIN_VALID_KW) return pacKw;
         if (dcPacKw != null && dcPacKw > PV_MIN_VALID_KW) return dcPacKw;
-        if (powSumKw!= null && powSumKw> PV_MIN_VALID_KW) return powSumKw;
-        if (dcAcKw  != null && dcAcKw  > PV_MIN_VALID_KW) return dcAcKw;
+        if (powSumKw != null && powSumKw > PV_MIN_VALID_KW) return powSumKw;
+        if (dcAcKw != null && dcAcKw > PV_MIN_VALID_KW) return dcAcKw;
 
-        if (pacKw   != null) return pacKw;
+        if (pacKw != null) return pacKw;
         if (dcPacKw != null) return dcPacKw;
-        if (powSumKw!= null) return powSumKw;
+        if (powSumKw != null) return powSumKw;
         return dcAcKw;
     }
 
-    /** Pick API load if it’s close to the physical balance; otherwise trust the balance. */
+    /**
+     * Pick API load if it’s close to the physical balance; otherwise trust the balance.
+     */
     private static Double pickPlausibleLoad(Double familyApiKw, Double totalApiKw, double computedKw) {
         double tol = Math.max(0.6, Math.abs(computedKw) * 0.35);
         if (familyApiKw != null && Math.abs(familyApiKw - computedKw) <= tol) return familyApiKw;
-        if (totalApiKw  != null && Math.abs(totalApiKw  - computedKw) <= tol) return totalApiKw;
+        if (totalApiKw != null && Math.abs(totalApiKw - computedKw) <= tol) return totalApiKw;
         return computedKw;
     }
 
-    /** MD5(body) in Base64, as required by Solis API. */
+    /**
+     * MD5(body) in Base64, as required by Solis API.
+     */
     private String md5Base64(String s) throws Exception {
         MessageDigest md = MessageDigest.getInstance("MD5");
         byte[] digest = md.digest(s.getBytes(StandardCharsets.UTF_8));
         return Base64.getEncoder().encodeToString(digest);
     }
 
-    /** RFC-1123 GMT date for the Date header. */
+    /**
+     * RFC-1123 GMT date for the Date header.
+     */
     private String httpDateGmt() {
         SimpleDateFormat sdf = new SimpleDateFormat("EEE, d MMM yyyy HH:mm:ss 'GMT'", Locale.US);
         sdf.setTimeZone(TimeZone.getTimeZone("GMT"));
         return sdf.format(new Date());
     }
 
-    /** HMAC-SHA1 signature for the canonical string, then Base64. */
+    /**
+     * HMAC-SHA1 signature for the canonical string, then Base64.
+     */
     private String signHmacSha1(String data, String key) throws Exception {
         Mac mac = Mac.getInstance("HmacSHA1");
         mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA1"));
@@ -337,14 +425,17 @@ public class SolisCloudClient {
 
     private static String safeJoin(String base, String path) {
         if (base == null) return path;
-        if (base.endsWith("/") && path.startsWith("/")) return base.substring(0, base.length()-1) + path;
+        if (base.endsWith("/") && path.startsWith("/")) return base.substring(0, base.length() - 1) + path;
         if (!base.endsWith("/") && !path.startsWith("/")) return base + "/" + path;
         return base + path;
     }
 
     private void sleepQuiet(long ms) {
-        try { Thread.sleep(Math.max(50, Math.min(ms, 4000))); }
-        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        try {
+            Thread.sleep(Math.max(50, Math.min(ms, 4000)));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -359,5 +450,6 @@ public class SolisCloudClient {
             Integer state,
             Integer warningInfoData,
             long fetchedAtMs
-    ) {}
+    ) {
+    }
 }

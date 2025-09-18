@@ -44,7 +44,8 @@ public class StatusService {
     @Value("${smartmetr.scale.ct:1.0}") private double ct;
 
     // Summary log period
-    private final int summaryEverySec = 5;
+    private final int summaryEverySec = 30;
+    private static final int REG_P1=356, REG_P2=358, REG_P3=360; // keep with your constants
 
     @PostConstruct
     void startSummaryLogger() {
@@ -84,6 +85,10 @@ public class StatusService {
         boolean alarm = (warnInfo != null && warnInfo != 0) || (solisState != null && solisState == 3);
         long solisAgeMs = (loadOverride.getLastUpdateMs() == 0L) ? -1 : (now - loadOverride.getLastUpdateMs());
 
+        int outP1W = (int)Math.round(readAcrelPPhaseW(out, REG_P1));
+        int outP2W = (int)Math.round(readAcrelPPhaseW(out, REG_P2));
+        int outP3W = (int)Math.round(readAcrelPPhaseW(out, REG_P3));
+
         return StatusView.builder()
                 // Grid/Solis
                 .gridImportKw(round3(importFromGrid))
@@ -109,9 +114,13 @@ public class StatusService {
                 .outI1(round2(outPh.i1))
                 .outI2(round2(outPh.i2))
                 .outI3(round2(outPh.i3))
-                .outPTotalW(outPTotalW)
                 .outAgeMs(outAgeMs)
                 .outAgeHuman(humanAge(outAgeMs))
+
+                .outPTotalW(outPTotalW)
+                .outP1W(outP1W)
+                .outP2W(outP2W)
+                .outP3W(outP3W)
 
                 // Solis extras
                 .pvPowerKw(Double.isNaN(pvKw) ? Double.NaN : round3(pvKw))
@@ -154,27 +163,26 @@ public class StatusService {
             Est smEst = estimatePhasePowers(
                     v.smV1, v.smI1, v.smV2, v.smI2, v.smV3, v.smI3, v.smPTotalW);
 
-            // Estimate per-phase powers for Out using SM voltages (we only have Out currents)
-            Est outEst = estimatePhasePowers(
-                    v.smV1, v.outI1, v.smV2, v.outI2, v.smV3, v.outI3, v.smPTotalW);
-
-            int targetW = (int)Math.round(loadOverride.getCurrentDeltaKw() * 1000.0);
-            int eW = v.smPTotalW - targetW;  // (remember: + = export), targetW uses same sign as bias
+            int targetW = (int) Math.round(loadOverride.getCurrentDeltaKw() * 1000.0);
+            int eW = v.smPTotalW - targetW;  // (+ = export); targetW uses same sign as bias
 
             log.info(
                     "Status: gridImport={}kW (psum={}kW, minImport={}kW) → compensate={}kW; " +
                             "SM: V1={}V I1={}A, V2={}V I2={}A, V3={}V I3={}A, " +
                             "S≈[{};{};{}]VA ΣS≈{}VA PF≈{} P≈[{};{};{}]W, Ptot={}W (age {}); " +
-                            "Out: I1={}A I2={}A I3={}A, P*≈[{};{};{}]W, PtotPub={}W (age {}); " +
+                            "Out: I1={}A I2={}A I3={}A, P=[{};{};{}]W, PtotPub={}W (age {}); " +
                             "ctrlErr={}W",
+                    // grid / solis
                     fmt(v.gridImportKw), fmt(v.gridRawPsumKw), fmt(v.minImportKw), fmt(v.compensationKw),
 
+                    // smart meter raw + derived
                     fmt(v.smV1), fmt(v.smI1), fmt(v.smV2), fmt(v.smI2), fmt(v.smV3), fmt(v.smI3),
                     fmt0(smEst.s1VA), fmt0(smEst.s2VA), fmt0(smEst.s3VA), fmt0(smEst.sTotVA), fmtPF(smEst.pfTot),
                     fmt0(smEst.p1W), fmt0(smEst.p2W), fmt0(smEst.p3W), v.smPTotalW, v.smAgeHuman,
 
+                    // output (real published per-phase powers)
                     fmt(v.outI1), fmt(v.outI2), fmt(v.outI3),
-                    fmt0(outEst.p1W), fmt0(outEst.p2W), fmt0(outEst.p3W), v.outPTotalW, v.outAgeHuman, eW
+                    fmt0(v.outP1W), fmt0(v.outP2W), fmt0(v.outP3W), v.outPTotalW, v.outAgeHuman, eW
             );
 
         } catch (Exception e) {
@@ -212,6 +220,12 @@ public class StatusService {
         int hi = u16(a, msw);
         int lo = u16(a, msw + 1);
         return (hi << 16) | lo;
+    }
+
+    private double readAcrelPPhaseW(short[] w, int regMsw) {
+        if (w == null) return 0.0;
+        int raw = i32be(w, regMsw);          // raw = W / (PT * CT)
+        return raw * pt * ct;
     }
 
     // ---------------------- formatting helpers ----------------------
@@ -264,6 +278,7 @@ public class StatusService {
         // Output
         float  outI1; float outI2; float outI3;
         int    outPTotalW;
+        int    outP1W; int outP2W; int outP3W;
         long   outAgeMs;
         String outAgeHuman;
 

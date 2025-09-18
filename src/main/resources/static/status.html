@@ -134,7 +134,7 @@
 
     <!-- Grid / Solis -->
     <section class="card">
-        <h2>Solis Hybrid Inverter output</h2>
+        <h2>Solis 50kW Hybrid Inverter output</h2>
 
         <!-- BIG headline: import/export with dynamic color -->
         <div class="big">
@@ -165,7 +165,7 @@
 
     <!-- Smart Meter (live) -->
     <section class="card">
-        <h2>Smart Meter</h2>
+        <h2>Smart Meter of 25kW Grid-tie inverter. Raw data</h2>
         <table>
             <thead><tr><th>Phase</th><th>Voltage (V)</th><th>Current (A)</th></tr></thead>
             <tbody>
@@ -182,7 +182,7 @@
 
     <!-- Grid-tie inverter setpoint (published via fake SM frame) -->
     <section class="card" id="gtCard">
-        <h2>Grid-tie inverter setpoint</h2>
+        <h2>Solis 25kW Grid-tie inverter input. Modified data</h2>
 
         <!-- BIG headline: P total with color & caption -->
         <div class="big">
@@ -278,8 +278,8 @@
         const a = Math.abs(pKw);
         if (a <= 1)        return {cls:"value-ok",     caption:"balanced (≈0 kW target)"};
         if (pKw > 1)       return {cls:"value-export", caption:"pass-through / not overriding"};
-        if (pKw > -2)      return {cls:"value-warn",   caption:"minor grid import likely"};
-        return                     {cls:"value-bad",    caption:"significant grid import likely"};
+        if (pKw > -2)      return {cls:"value-warn",   caption:"minor grid import"};
+        return                     {cls:"value-bad",    caption:"significant grid import"};
     }
     async function refresh() {
         try {
@@ -358,15 +358,9 @@
 // ----- Grid-tie inverter setpoint (Output) -----
             {
                 // Per-phase power estimate (same method as server logs)
-                const est = estimatePhasePowers(
-                    v.smV1, v.outI1,
-                    v.smV2, v.outI2,
-                    v.smV3, v.outI3,
-                    v.smPTotalW  // use smart-meter total W as PF anchor
-                );
-                document.getElementById("outP1").textContent = est.p1.toString();
-                document.getElementById("outP2").textContent = est.p2.toString();
-                document.getElementById("outP3").textContent = est.p3.toString();
+                document.getElementById("outP1").textContent = fmt(v.outP1W);
+                document.getElementById("outP2").textContent = fmt(v.outP2W);
+                document.getElementById("outP3").textContent = fmt(v.outP3W);
 
                 // P total headline with color + caption
                 const pTotW  = (typeof v.outPTotalW === "number") ? v.outPTotalW : NaN;

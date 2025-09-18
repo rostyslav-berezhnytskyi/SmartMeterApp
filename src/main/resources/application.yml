@@ -48,6 +48,8 @@ solis:
   smoothingFactor: ${SOLIS_SMOOTHING_FACTOR:0.8}        # 0..1 (1.0 = no smoothing)
   # compensation switch (default ON). Can be overridden by env SOLIS_OVERRIDE_ENABLED=true/false
   overrideEnabled: ${SOLIS_OVERRIDE_ENABLED:true}
+  http:
+    graceMs: 60000           # 60s of continuous failure before SOLIS_DOWN is raised
 
 logging:
   level:
@@ -68,6 +70,8 @@ smartmetr:
     pt: ${SMARTMETR_ACREL_PT:1.0}
     ct: ${SMARTMETR_ACREL_CT:30.0}
   editCurrents: false
+  publish:
+    rateLimitKwPerSec: ${SMARTMETR_PUBLISH_RATELIMITKW:2.0}
 
 
 management:
