@@ -44,7 +44,7 @@ public class StatusService {
     @Value("${smartmetr.scale.ct:1.0}") private double ct;
 
     // Summary log period
-    private final int summaryEverySec = 30;
+    private final int summaryEverySec = 1;
     private static final int REG_P1=356, REG_P2=358, REG_P3=360; // keep with your constants
 
     @PostConstruct

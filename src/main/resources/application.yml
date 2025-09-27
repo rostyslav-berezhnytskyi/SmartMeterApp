@@ -72,6 +72,7 @@ smartmetr:
   editCurrents: false
   publish:
     rateLimitKwPerSec: ${SMARTMETR_PUBLISH_RATELIMITKW:2.0}
+    rateLimitNeutralKwPerSec: 1.0
 
 
 management:

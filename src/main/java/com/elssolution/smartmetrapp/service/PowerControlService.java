@@ -25,6 +25,10 @@ public class PowerControlService {
     @Value("${smartmetr.publish.rateLimitKwPerSec:3.0}")
     private double publishRateLimitKwPerSec;
 
+    /** Max change speed when COMPENSATION is neutral/off (kW/s). */
+    @Value("${smartmetr.publish.rateLimitNeutralKwPerSec:1.0}")
+    private double publishRateLimitNeutralKwPerSec;
+
     // ====== Acrel register addresses ======
     private static final int REG_V1   =  97;
     private static final int REG_V2   =  98;
@@ -64,44 +68,33 @@ public class PowerControlService {
         final double PT = (pt > 0 && Double.isFinite(pt)) ? pt : 1.0;
         final double CT = (ct > 0 && Double.isFinite(ct)) ? ct : 1.0;
 
-        // === PASS-THROUGH if override disabled/zero ===
-        if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) {
-            resetSlew(); // so the next time we re-enable, we don't "catch up" aggressively
-            return out;
-        }
-
-        // === Safety: stale/offline meter → pass-through (or zero if you prefer) ===
+        // If meter is stale or offline — keep previous publish (or pass-through) and reset slew
         final long age = (snapshot == null || snapshot.updatedAtMs == 0)
                 ? Long.MAX_VALUE : (System.currentTimeMillis() - snapshot.updatedAtMs);
         if (age > maxAgeMs || acrelOffline(out, PT)) {
             resetSlew();
-            return out; // (or zeroCurrentsAndPowers(out); return out;)
+            return out; // feeder will republish last good frame if configured
         }
 
-        // === Read raw powers (W) ===
+        // Read raw (W)
         double rawP1W   = i32be(out, REG_P1  ) * PT * CT;
         double rawP2W   = i32be(out, REG_P2  ) * PT * CT;
         double rawP3W   = i32be(out, REG_P3  ) * PT * CT;
         double rawPTotW = i32be(out, REG_PTOT) * PT * CT;
 
-        // === Median-3 spike filter on meter powers ===
+        // Median-3 spike filter (we keep histories of RAW samples)
         double p1W   = median3WithNaN(rawP1W,   p1Prev1, p1Prev2);
         double p2W   = median3WithNaN(rawP2W,   p2Prev1, p2Prev2);
         double p3W   = median3WithNaN(rawP3W,   p3Prev1, p3Prev2);
         double pTotW = median3WithNaN(rawPTotW, ptPrev1, ptPrev2);
 
-        // shift raw history (we keep RAW, not filtered, inside the window)
+        // shift history
         p1Prev2 = p1Prev1; p1Prev1 = rawP1W;
         p2Prev2 = p2Prev1; p2Prev1 = rawP2W;
         p3Prev2 = p3Prev1; p3Prev1 = rawP3W;
         ptPrev2 = ptPrev1; ptPrev1 = rawPTotW;
 
-        // === Build desired published powers after compensation ===
-        final double biasW  = compensateKw * 1000.0;
-        final double pTotDesiredW = pTotW - biasW;   // total we want to present
-        final double dW = pTotDesiredW - pTotW;      // same offset we distribute
-
-        // Alive phases?
+        // Alive phases decision
         final double v1 = 0.1 * u16(out, REG_V1) * PT;
         final double v2 = 0.1 * u16(out, REG_V2) * PT;
         final double v3 = 0.1 * u16(out, REG_V3) * PT;
@@ -111,39 +104,65 @@ public class PowerControlService {
             resetSlew();
             return out;
         }
+
+        // ----- NEUTRAL MODE (compensation <= 0): FOLLOW METER *WITH SLEW* -----
+        if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) {
+            double targetP1 = p1W, targetP2 = p2W, targetP3 = p3W;
+            // Slew using the neutral (conservative) rate
+            long now = System.currentTimeMillis();
+            double dtSec = (lastPubMs == 0L) ? 1.0 : Math.max(0.2, (now - lastPubMs) / 1000.0);
+            double stepMaxW = Math.max(0.0, publishRateLimitNeutralKwPerSec) * 1000.0 * dtSec;
+
+            double p1Pub = limitSlew(lastPubP1W, targetP1, stepMaxW);
+            double p2Pub = limitSlew(lastPubP2W, targetP2, stepMaxW);
+            double p3Pub = limitSlew(lastPubP3W, targetP3, stepMaxW);
+            double pTotPub = p1Pub + p2Pub + p3Pub;
+
+            // small negative bias to avoid dithering at exactly zero
+            final double biasMinW = 0;
+            if (Math.abs(pTotPub) < biasMinW) pTotPub = -biasMinW;
+
+            if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
+            if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
+            if (a3) writeI32be(out, REG_P3,   toRawPower(p3Pub,  PT, CT));
+            writeI32be(out, REG_PTOT, toRawPower(pTotPub, PT, CT));
+
+            lastPubMs   = now;
+            lastPubP1W  = p1Pub;
+            lastPubP2W  = p2Pub;
+            lastPubP3W  = p3Pub;
+            lastPubTotW = pTotPub;
+
+            return out;
+        }
+
+        // ----- COMPENSATION MODE (your existing logic, but without resetting slew) -----
+        final double biasW  = compensateKw * 1000.0;
+        final double pTotDesiredW = pTotW - biasW;
+        final double dW = pTotDesiredW - pTotW;
         double perAlive = dW / alive;
 
-        // Desired per-phase powers before slew limiting
         double dP1 = a1 ? (p1W + perAlive) : p1W;
         double dP2 = a2 ? (p2W + perAlive) : p2W;
         double dP3 = a3 ? (p3W + perAlive) : p3W;
 
-        // === Publish-side slew limiting ===
         long now = System.currentTimeMillis();
-        double dtSec = (lastPubMs == 0L) ? 1.0 : Math.max(0.2, (now - lastPubMs) / 1000.0); // guard against 0
+        double dtSec = (lastPubMs == 0L) ? 1.0 : Math.max(0.2, (now - lastPubMs) / 1000.0);
         double stepMaxW = Math.max(0.0, publishRateLimitKwPerSec) * 1000.0 * dtSec;
 
-        double p1Pub = limitSlew(lastPubP1W,  dP1,          stepMaxW);
-        double p2Pub = limitSlew(lastPubP2W,  dP2,          stepMaxW);
-        double p3Pub = limitSlew(lastPubP3W,  dP3,          stepMaxW);
-
-        // For total, we have two options:
-        //  - recompute as sum of clamped phases (most consistent), or
-        //  - slew-limit the desired total separately.
-        // We'll use the sum of clamped phases to keep internal accounting tight:
+        double p1Pub = limitSlew(lastPubP1W, dP1, stepMaxW);
+        double p2Pub = limitSlew(lastPubP2W, dP2, stepMaxW);
+        double p3Pub = limitSlew(lastPubP3W, dP3, stepMaxW);
         double pTotPub = p1Pub + p2Pub + p3Pub;
 
-        // Near-zero bias to avoid dithering at exact zero (import is negative on Acrel)
-        final double biasMinW = 80; // tune 20..100
+        final double biasMinW = 0;
         if (Math.abs(pTotPub) < biasMinW) pTotPub = -biasMinW;
 
-        // === Write registers ===
         if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
         if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
         if (a3) writeI32be(out, REG_P3,   toRawPower(p3Pub,  PT, CT));
         writeI32be(out, REG_PTOT, toRawPower(pTotPub, PT, CT));
 
-        // === Update slew state ===
         lastPubMs   = now;
         lastPubP1W  = p1Pub;
         lastPubP2W  = p2Pub;
@@ -152,6 +171,7 @@ public class PowerControlService {
 
         return out;
     }
+
 
     // ====== helpers ======
 

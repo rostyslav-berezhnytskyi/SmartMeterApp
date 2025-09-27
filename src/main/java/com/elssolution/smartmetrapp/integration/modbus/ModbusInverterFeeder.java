@@ -114,7 +114,8 @@ public class ModbusInverterFeeder {
         }
 
         try {
-            SerialPortWrapper wrapper = new SerialPortWrapperImpl(port, baudRate);
+            SerialPortWrapper wrapper =
+                    new SerialPortWrapperImpl(port, baudRate, /*read*/300, /*write*/200, /*forSlave*/ true);
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
 
             // <<< swap in the atomic image >>>

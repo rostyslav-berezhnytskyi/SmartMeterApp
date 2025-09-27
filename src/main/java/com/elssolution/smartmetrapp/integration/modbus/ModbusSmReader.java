@@ -234,7 +234,8 @@ public class ModbusSmReader {
         if (master != null) return;
         synchronized (masterLock) {
             if (master != null) return;
-            SerialPortWrapper wrapper = new SerialPortWrapperImpl(port, baudRate);
+            SerialPortWrapper wrapper =
+                    new SerialPortWrapperImpl(port, baudRate, /*read*/1000, /*write*/300, /*forSlave*/ false);
             ModbusMaster m = new ModbusFactory().createRtuMaster(wrapper);
             m.setTimeout(1200);
             m.setRetries(0);

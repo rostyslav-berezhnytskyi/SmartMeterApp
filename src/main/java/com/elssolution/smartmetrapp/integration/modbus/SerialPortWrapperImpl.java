@@ -21,11 +21,17 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
     @Value("${serial.io.writeTimeoutMs:1000}")
     private int writeTimeoutMs;
 
+
+    private boolean forSlave; // true = RTU slave (respond to polls)
     private SerialPort serialPort;
 
-    public SerialPortWrapperImpl(String portName, int baudRate) {
+    public SerialPortWrapperImpl(String portName, int baudRate,
+                                 int readTimeoutMs, int writeTimeoutMs, boolean forSlave) {
         this.portName = portName;
         this.baudRate = baudRate;
+        this.readTimeoutMs = Math.max(50, readTimeoutMs);
+        this.writeTimeoutMs = Math.max(50, writeTimeoutMs);
+        this.forSlave = forSlave;
     }
 
     @Override
@@ -36,8 +42,9 @@ public class SerialPortWrapperImpl implements SerialPortWrapper {
 
         serialPort = SerialPort.getCommPort(portName);
         serialPort.setComPortParameters(baudRate, 8, SerialPort.ONE_STOP_BIT, SerialPort.NO_PARITY);
-        // Use semi-blocking read, which plays well with Modbus4J per-request timeout.
-        serialPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, readTimeoutMs, writeTimeoutMs);
+        int mode = forSlave ? SerialPort.TIMEOUT_READ_BLOCKING
+                : SerialPort.TIMEOUT_READ_SEMI_BLOCKING;
+        serialPort.setComPortTimeouts(mode, readTimeoutMs, writeTimeoutMs);
 
         log.info("serial_open port={} baud={} dataBits=8 stopBits=1 parity=NONE rTimeoutMs={} wTimeoutMs={}",
                 portName, baudRate, readTimeoutMs, writeTimeoutMs);
