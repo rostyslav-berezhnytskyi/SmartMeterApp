@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
  * - Otherwise:
  *     importKw = max(0, -psumKw)   // psum<0 means importing
  *     target   = (importKw > minImportKw) ? importKw : 0
+ *     if target == 0 and importFloorKw>0 → use importFloorKw instead
  *     currentDeltaKw = EMA(previous, target, smoothingFactor) + slew limiting + clamps
  */
 @Slf4j
@@ -42,7 +43,7 @@ public class LoadOverrideService {
     private int fetchPeriodSeconds;
 
     /** Minimum import from grid (kW) before we start compensating. */
-    @Value("${solis.minImportKw:0.2}")
+    @Value("${solis.minImportKw:1.0}")
     private double minImportKw;
 
     /** If no fresh API response within this time, treat delta as 0 (ms). */
@@ -56,6 +57,10 @@ public class LoadOverrideService {
     /** Hard cap for requested compensation (kW). */
     @Value("${smartmetr.clamp.maxKw:50}")
     private double clampMaxKw;
+
+    /** Minimum override (kW) to keep the inverter engaged even if import is ~0. */
+    @Value("${solis.importFloorKw:2.0}")
+    private double importFloorKw;
 
     /** Max rate-of-change (kW per second) for the commanded delta. */
     @Value("${smartmetr.deltaMaxKwPerSec:2}")
@@ -102,10 +107,18 @@ public class LoadOverrideService {
             log.warn("deltaMaxKwPerSec < 0 ({}). Clamping to 0.", deltaMaxKwPerSec);
             deltaMaxKwPerSec = 0;
         }
+        if (importFloorKw < 0) {
+            log.warn("importFloorKw < 0 ({}). Clamping to 0.", importFloorKw);
+            importFloorKw = 0;
+        }
+        if (importFloorKw > clampMaxKw) {
+            log.warn("importFloorKw ({}) > clampMaxKw ({}). Using clampMaxKw.", importFloorKw, clampMaxKw);
+            importFloorKw = clampMaxKw;
+        }
 
         scheduler.scheduleWithFixedDelay(this::pollOnceSafe, 5, fetchPeriodSeconds, TimeUnit.SECONDS);
-        log.info("Solis override polling: every={}s, minImportKw={} kW, maxDataAgeMs={}, smoothingFactor={}, clampMaxKw={}, deltaMaxKwPerSec={}",
-                fetchPeriodSeconds, minImportKw, maxDataAgeMs, smoothingFactor, clampMaxKw, deltaMaxKwPerSec);
+        log.info("Solis override polling: every={}s, minImportKw={} kW, importFloorKw={} kW, maxDataAgeMs={}, smoothingFactor={}, clampMaxKw={}, deltaMaxKwPerSec={}",
+                fetchPeriodSeconds, minImportKw, importFloorKw, maxDataAgeMs, smoothingFactor, clampMaxKw, deltaMaxKwPerSec);
     }
 
     /** One safe polling cycle: fetch psum from Solis and update currentDeltaKw. */
@@ -145,6 +158,9 @@ public class LoadOverrideService {
             // ---- Target from psum (import only), apply deadband
             double importKw = (lastPsumKw < 0) ? Math.abs(lastPsumKw) : 0.0;
             double target   = (importKw > minImportKw) ? importKw : 0.0;
+            if (importFloorKw > 0.0) {
+                target = Math.max(target, importFloorKw);
+            }
 
             // Hard clamp
             target = Math.min(target, clampMaxKw);

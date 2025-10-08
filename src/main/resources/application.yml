@@ -43,13 +43,14 @@ solis:
     uri: ${SOLIS_URI}
   fetch:
     periodSeconds: ${SOLIS_FETCH_PERIOD_SECONDS:10}     # how often to call Solis API
-  minImportKw: ${SOLIS_MIN_IMPORT_KW:0.2}               # ignore grid import below this (deadband)
+  minImportKw: ${SOLIS_MIN_IMPORT_KW:1.0}               # ignore grid import below this (deadband)
   maxDataAgeMs: ${SOLIS_MAX_DATA_AGE_MS:300000}         # if no API updates for this long, treat delta as 0
   smoothingFactor: ${SOLIS_SMOOTHING_FACTOR:0.8}        # 0..1 (1.0 = no smoothing)
   # compensation switch (default ON). Can be overridden by env SOLIS_OVERRIDE_ENABLED=true/false
   overrideEnabled: ${SOLIS_OVERRIDE_ENABLED:true}
   http:
     graceMs: 60000           # 60s of continuous failure before SOLIS_DOWN is raised
+  importFloorKw: ${SOLIS_IMPORT_FLOOR:2.0}
 
 logging:
   level:

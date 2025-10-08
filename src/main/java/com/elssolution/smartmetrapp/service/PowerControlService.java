@@ -107,20 +107,22 @@ public class PowerControlService {
 
         // ----- NEUTRAL MODE (compensation <= 0): FOLLOW METER *WITH SLEW* -----
         if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) {
-            double targetP1 = p1W, targetP2 = p2W, targetP3 = p3W;
-            // Slew using the neutral (conservative) rate
+            // Neutral path must be a faithful pass-through so the inverter never "hunts"
+            // when there is no Solis override. We still use the filtered samples above
+            // (median-3) to reject spikes, but we publish them without any slew limiting.
             long now = System.currentTimeMillis();
-            double dtSec = (lastPubMs == 0L) ? 1.0 : Math.max(0.2, (now - lastPubMs) / 1000.0);
-            double stepMaxW = Math.max(0.0, publishRateLimitNeutralKwPerSec) * 1000.0 * dtSec;
 
-            double p1Pub = limitSlew(lastPubP1W, targetP1, stepMaxW);
-            double p2Pub = limitSlew(lastPubP2W, targetP2, stepMaxW);
-            double p3Pub = limitSlew(lastPubP3W, targetP3, stepMaxW);
-            double pTotPub = p1Pub + p2Pub + p3Pub;
-
-            // small negative bias to avoid dithering at exactly zero
-            final double biasMinW = 0;
-            if (Math.abs(pTotPub) < biasMinW) pTotPub = -biasMinW;
+            double p1Pub = p1W;
+            double p2Pub = p2W;
+            double p3Pub = p3W;
+            double pTotPub = pTotW;
+            if (!Double.isFinite(pTotPub)) {
+                double sum = 0.0;
+                if (Double.isFinite(p1Pub)) sum += p1Pub;
+                if (Double.isFinite(p2Pub)) sum += p2Pub;
+                if (Double.isFinite(p3Pub)) sum += p3Pub;
+                pTotPub = sum;
+            }
 
             if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
             if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
