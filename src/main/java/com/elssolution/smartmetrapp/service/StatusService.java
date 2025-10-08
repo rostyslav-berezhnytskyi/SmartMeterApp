@@ -167,9 +167,9 @@ public class StatusService {
             int eW = v.smPTotalW - targetW;  // (+ = export); targetW uses same sign as bias
 
             log.info(
-                    "Status: gridImport={}kW (psum={}kW, minImport={}kW) → compensate={}kW; " +
+                    "Status: gridImport={}kW (psum={}kW, minImport={}kW) -> compensate={}kW; " +
                             "SM: V1={}V I1={}A, V2={}V I2={}A, V3={}V I3={}A, " +
-                            "S≈[{};{};{}]VA ΣS≈{}VA PF≈{} P≈[{};{};{}]W, Ptot={}W (age {}); " +
+                            "S~[{};{};{}]VA SumS={}VA PF~{} P~[{};{};{}]W, Ptot={}W (age {}); " +
                             "Out: I1={}A I2={}A I3={}A, P=[{};{};{}]W, PtotPub={}W (age {}); " +
                             "ctrlErr={}W",
                     // grid / solis
