@@ -18,16 +18,12 @@ public class PowerControlService {
     /** A phase is considered "alive" if its phase-to-neutral V >= this. */
     @Value("${smartmetr.phaseMinVolt:100.0}")  private double phaseMinVolt;
 
-    /** Guard in I = P/(V*pf) to avoid huge currents when V is tiny. */
-    @Value("${smartmetr.safeDivMinVolt:100.0}")private double safeDivMinVolt;
-
     /** Max change speed we allow the published setpoint to move (kW/s). */
     @Value("${smartmetr.publish.rateLimitKwPerSec:3.0}")
     private double publishRateLimitKwPerSec;
 
-    /** Max change speed when COMPENSATION is neutral/off (kW/s). */
-    @Value("${smartmetr.publish.rateLimitNeutralKwPerSec:1.0}")
-    private double publishRateLimitNeutralKwPerSec;
+    @Value("${smartmetr.publish.maxGridPurchaseKw:29.0}")
+    private double maxGridPurchaseKw;
 
     // ====== Acrel register addresses ======
     private static final int REG_V1   =  97;
@@ -105,7 +101,7 @@ public class PowerControlService {
             return out;
         }
 
-        // ----- NEUTRAL MODE (compensation <= 0): FOLLOW METER *WITH SLEW* -----
+        // ----- NEUTRAL MODE (compensation <= 0): pass-through (no slew), but cap max purchase -----
         if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) {
             // Neutral path must be a faithful pass-through so the inverter never "hunts"
             // when there is no Solis override. We still use the filtered samples above
@@ -115,14 +111,10 @@ public class PowerControlService {
             double p1Pub = p1W;
             double p2Pub = p2W;
             double p3Pub = p3W;
-            double pTotPub = pTotW;
-            if (!Double.isFinite(pTotPub)) {
-                double sum = 0.0;
-                if (Double.isFinite(p1Pub)) sum += p1Pub;
-                if (Double.isFinite(p2Pub)) sum += p2Pub;
-                if (Double.isFinite(p3Pub)) sum += p3Pub;
-                pTotPub = sum;
-            }
+            // cap total purchase
+            double[] capped = capTotalImport3(p1Pub, p2Pub, p3Pub, a1, a2, a3);
+            p1Pub = capped[0]; p2Pub = capped[1]; p3Pub = capped[2];
+            double pTotPub = p1Pub + p2Pub + p3Pub;
 
             if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
             if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
@@ -155,10 +147,11 @@ public class PowerControlService {
         double p1Pub = limitSlew(lastPubP1W, dP1, stepMaxW);
         double p2Pub = limitSlew(lastPubP2W, dP2, stepMaxW);
         double p3Pub = limitSlew(lastPubP3W, dP3, stepMaxW);
-        double pTotPub = p1Pub + p2Pub + p3Pub;
 
-        final double biasMinW = 0;
-        if (Math.abs(pTotPub) < biasMinW) pTotPub = -biasMinW;
+        // cap total purchase
+        double[] capped = capTotalImport3(p1Pub, p2Pub, p3Pub, a1, a2, a3);
+        p1Pub = capped[0]; p2Pub = capped[1]; p3Pub = capped[2];
+        double pTotPub = p1Pub + p2Pub + p3Pub;
 
         if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
         if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
@@ -180,6 +173,27 @@ public class PowerControlService {
     private void resetSlew() {
         lastPubMs = 0L;
         lastPubP1W = lastPubP2W = lastPubP3W = lastPubTotW = Double.NaN;
+    }
+
+    // shared helper: cap total purchase and spread correction across alive phases
+    private double[] capTotalImport3(double p1, double p2, double p3,
+                                     boolean a1, boolean a2, boolean a3) {
+        int alive = (a1?1:0) + (a2?1:0) + (a3?1:0);
+        if (alive == 0) return new double[]{p1, p2, p3};
+        double pTot = p1 + p2 + p3;
+        double maxImportW = Math.max(0.0, maxGridPurchaseKw) * 1000.0;
+        if (pTot < -maxImportW) {
+            double need = (-maxImportW) - pTot; // >0 we must add across phases
+            double per  = need / alive;
+            if (a1) p1 += per;
+            if (a2) p2 += per;
+            if (a3) p3 += per;
+            if (log.isDebugEnabled()) {
+                log.debug("Cap grid-purchase from {} kW to {} kW (alive={})",
+                        -(pTot/1000.0), maxGridPurchaseKw, alive);
+            }
+        }
+        return new double[]{p1, p2, p3};
     }
 
     private static double median3WithNaN(double a, double b, double c) {

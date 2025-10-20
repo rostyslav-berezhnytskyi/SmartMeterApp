@@ -53,7 +53,7 @@ public class ModbusInverterFeeder {
     @Value("${serial.output.baudRate}") private int    baudRate;
 
     /** Pre-zero this many registers on open (04 & 03). Should cover every index the inverter might read. */
-    @Value("${serial.output.initRegisters:400}")
+    @Value("${serial.output.initRegisters:0}")
     private int initRegisters;
 
     /** If meter snapshot is older than this, do not overwrite the image (avoid feeding junk). */
@@ -114,12 +114,14 @@ public class ModbusInverterFeeder {
         }
 
         try {
+            // IMPORTANT: slave must be 0/0 timeouts
             SerialPortWrapper wrapper =
-                    new SerialPortWrapperImpl(port, baudRate, /*read*/300, /*write*/200, /*forSlave*/ true);
+                    new SerialPortWrapperImpl(port, baudRate, /*read*/0, /*write*/0, /*forSlave*/ true);
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
 
-            // <<< swap in the atomic image >>>
-            AtomicSnapshotImage newImage = new AtomicSnapshotImage(slaveId, Math.max(400, initRegisters));
+            // Honor initRegisters, but never block on a big prefill—start at 0 length.
+            int initialLen = Math.max(0, initRegisters);   // with the new default this is 0
+            AtomicSnapshotImage newImage = new AtomicSnapshotImage(slaveId, initialLen);
 
             newSlave.addProcessImage(newImage);
             newSlave.start();
