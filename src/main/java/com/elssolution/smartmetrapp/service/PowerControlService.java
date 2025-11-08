@@ -1,194 +1,263 @@
 package com.elssolution.smartmetrapp.service;
 
-import com.elssolution.smartmetrapp.domain.MeterDecoder;
-import com.elssolution.smartmetrapp.domain.MeterRegisterMap;
 import com.elssolution.smartmetrapp.domain.SmSnapshot;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
-import static com.elssolution.smartmetrapp.domain.Maths.clamp;
-import static com.elssolution.smartmetrapp.domain.Maths.safeDiv;
-
-/**
- * Builds the Modbus output words for the inverter:
- * - if the smart-meter data is too old -> drive currents & powers to 0 (keep voltages)
- * - if fresh -> add compensated power evenly across 3 phases (adjust currents; bump total power)
- *
- * Notes:
- * - We assume a 3-phase layout by default.
- * - All calculations use IEEE754 floats on the wire (handled by MeterCodec).
- */
 @Slf4j
 @Component
 public class PowerControlService {
 
-    private final MeterDecoder codec;
-    private final MeterRegisterMap registerMap;
+    // ====== Config (from application.yml) ======
+    @Value("${smartmetr.scale.pt:1.0}")        private double pt;
+    @Value("${smartmetr.scale.ct:1.0}")        private double ct;
+    @Value("${smartmetr.cosPhiMin:0.95}")      private double minPf;
+    @Value("${smartmetr.staleToZeroMs:300000}")private long   maxAgeMs;
 
-    public PowerControlService(MeterDecoder codec, MeterRegisterMap registerMap) {
-        this.codec = codec;
-        this.registerMap = registerMap;
-    }
+    /** A phase is considered "alive" if its phase-to-neutral V >= this. */
+    @Value("${smartmetr.phaseMinVolt:100.0}")  private double phaseMinVolt;
 
-    @Value("${smartmetr.maxDataAgeMs:300000}") // 5 minutes default
-    private long maxDataAgeMs;
+    /** Max change speed we allow the published setpoint to move (kW/s). */
+    @Value("${smartmetr.publish.rateLimitKwPerSec:3.0}")
+    private double publishRateLimitKwPerSec;
 
-    @Value("${smartmetr.rampToZeroMs:2000}")
-    private long rampToZeroMs;
+    @Value("${smartmetr.publish.maxGridPurchaseKw:29.0}")
+    private double maxGridPurchaseKw;
 
-    /** Minimum power factor to use when converting kW→A. Clamped to [0.1, 1.0]. */
-    @Value("${smartmetr.minPowerFactor:0.95}")
-    private double minPowerFactor;
+    // ====== Acrel register addresses ======
+    private static final int REG_V1   =  97;
+    private static final int REG_V2   =  98;
+    private static final int REG_V3   =  99;
+    private static final int REG_I1   = 100;
+    private static final int REG_I2   = 101;
+    private static final int REG_I3   = 102;
+    private static final int REG_P1   = 356; // i32 MSW
+    private static final int REG_P2   = 358; // i32 MSW
+    private static final int REG_P3   = 360; // i32 MSW
+    private static final int REG_PTOT = 362; // i32 MSW
+
+    // ---- Median-3 history (raw samples) ----
+    private volatile double p1Prev1 = Double.NaN, p1Prev2 = Double.NaN;
+    private volatile double p2Prev1 = Double.NaN, p2Prev2 = Double.NaN;
+    private volatile double p3Prev1 = Double.NaN, p3Prev2 = Double.NaN;
+    private volatile double ptPrev1 = Double.NaN, ptPrev2 = Double.NaN;
+
+    // ---- Publish-side slew limiter state ----
+    private volatile long   lastPubMs   = 0L;
+    private volatile double lastPubP1W  = Double.NaN;
+    private volatile double lastPubP2W  = Double.NaN;
+    private volatile double lastPubP3W  = Double.NaN;
+    private volatile double lastPubTotW = Double.NaN;
 
     /**
-     * Build the words to publish to the inverter.
-     * @param snapshot last good meter read (raw words + timestamp)
-     * @param compensateKw how many kW we want to absorb (>= 0)
+     * Build the output frame for the inverter using Acrel native registers only.
+     *
+     * @param snapshot     last meter frame (Acrel raw registers)
+     * @param compensateKw positive kW we want to add to site load (split across phases)
+     * @return the register image to expose to the inverter (same layout as input, with edits)
      */
     public short[] prepareOutputWords(SmSnapshot snapshot, double compensateKw) {
-        // Allocate from snapshot if available, otherwise a sensible default write window
-        final int len = (snapshot != null && snapshot.data != null)
-                ? snapshot.data.length : 100; // matches WRITE_REG_COUNT in feeder
-        short[] outWords = (snapshot != null && snapshot.data != null)
-                ? snapshot.data.clone()
-                : new short[len];
+        short[] base = (snapshot != null && snapshot.data != null) ? snapshot.data : new short[0];
+        short[] out  = ensureCapacity(base, 364);
 
-        if (!isRecent(snapshot, maxDataAgeMs) || isOffline(outWords)) {
-            long age = (snapshot == null) ? -1L : (System.currentTimeMillis() - snapshot.updatedAtMs);
-            log.info("meter_data_stale ageMs={} → driving currents & powers to 0", age);
-            driveToNeutral(outWords);
-            return outWords;
+        final double PT = (pt > 0 && Double.isFinite(pt)) ? pt : 1.0;
+        final double CT = (ct > 0 && Double.isFinite(ct)) ? ct : 1.0;
+
+        // If meter is stale or offline — keep previous publish (or pass-through) and reset slew
+        final long age = (snapshot == null || snapshot.updatedAtMs == 0)
+                ? Long.MAX_VALUE : (System.currentTimeMillis() - snapshot.updatedAtMs);
+        if (age > maxAgeMs || acrelOffline(out, PT)) {
+            resetSlew();
+            return out; // feeder will republish last good frame if configured
         }
 
-        // Defensive clamp
-        if (Double.isNaN(compensateKw) || compensateKw < 0.0) compensateKw = 0.0;
+        // Read raw (W)
+        double rawP1W   = i32be(out, REG_P1  ) * PT * CT;
+        double rawP2W   = i32be(out, REG_P2  ) * PT * CT;
+        double rawP3W   = i32be(out, REG_P3  ) * PT * CT;
+        double rawPTotW = i32be(out, REG_PTOT) * PT * CT;
 
-        if (compensateKw > 0.0) {
-            applyCompensationThreePhase(outWords, compensateKw);
-        }
-        return outWords;
-    }
+        // Median-3 spike filter (we keep histories of RAW samples)
+        double p1W   = median3WithNaN(rawP1W,   p1Prev1, p1Prev2);
+        double p2W   = median3WithNaN(rawP2W,   p2Prev1, p2Prev2);
+        double p3W   = median3WithNaN(rawP3W,   p3Prev1, p3Prev2);
+        double pTotW = median3WithNaN(rawPTotW, ptPrev1, ptPrev2);
 
-    private boolean isRecent(SmSnapshot s, long maxAgeMs) {
-        if (s == null || s.updatedAtMs <= 0) return false;
-        return (System.currentTimeMillis() - s.updatedAtMs) <= maxAgeMs;
-    }
+        // shift history
+        p1Prev2 = p1Prev1; p1Prev1 = rawP1W;
+        p2Prev2 = p2Prev1; p2Prev1 = rawP2W;
+        p3Prev2 = p3Prev1; p3Prev1 = rawP3W;
+        ptPrev2 = ptPrev1; ptPrev1 = rawPTotW;
 
-    /** Zero active power(s) & current(s); keep voltages (0 V can be treated as a fault). */
-    private void driveToNeutral(short[] words) {
-        float pTot = readSafe(words, registerMap.pTotal());
-        float i1   = readSafe(words, registerMap.iL1());
-        float i2   = readSafe(words, registerMap.iL2());
-        float i3   = readSafe(words, registerMap.iL3());
-
-        final float pTarget = 0f, iTarget = 0f;
-        if (rampToZeroMs > 0) {
-            pTot = rampTowards(pTot, pTarget, rampToZeroMs);
-            i1   = rampTowards(i1,   iTarget, rampToZeroMs);
-            i2   = rampTowards(i2,   iTarget, rampToZeroMs);
-            i3   = rampTowards(i3,   iTarget, rampToZeroMs);
-        } else {
-            pTot = pTarget; i1 = iTarget; i2 = iTarget; i3 = iTarget;
+        // Alive phases decision
+        final double v1 = 0.1 * u16(out, REG_V1) * PT;
+        final double v2 = 0.1 * u16(out, REG_V2) * PT;
+        final double v3 = 0.1 * u16(out, REG_V3) * PT;
+        boolean a1 = v1 >= phaseMinVolt, a2 = v2 >= phaseMinVolt, a3 = v3 >= phaseMinVolt;
+        int alive = (a1?1:0) + (a2?1:0) + (a3?1:0);
+        if (alive == 0) {
+            resetSlew();
+            return out;
         }
 
-        writeIfPresent(words, registerMap.pTotal(), pTot);
-        writeIfPresent(words, registerMap.iL1(),   i1);
-        writeIfPresent(words, registerMap.iL2(),   i2);
-        writeIfPresent(words, registerMap.iL3(),   i3);
+        // ----- NEUTRAL MODE (compensation <= 0): pass-through (no slew), but cap max purchase -----
+        if (!Double.isFinite(compensateKw) || compensateKw <= 0.0) {
+            // Neutral path must be a faithful pass-through so the inverter never "hunts"
+            // when there is no Solis override. We still use the filtered samples above
+            // (median-3) to reject spikes, but we publish them without any slew limiting.
+            long now = System.currentTimeMillis();
 
-        writeIfPresent(words, registerMap.pL1(), 0f);
-        writeIfPresent(words, registerMap.pL2(), 0f);
-        writeIfPresent(words, registerMap.pL3(), 0f);
-    }
+            double p1Pub = p1W;
+            double p2Pub = p2W;
+            double p3Pub = p3W;
+            // cap total purchase
+            double[] capped = capTotalImport3(p1Pub, p2Pub, p3Pub, a1, a2, a3);
+            p1Pub = capped[0]; p2Pub = capped[1]; p3Pub = capped[2];
+            double pTotPub = p1Pub + p2Pub + p3Pub;
 
-    /**
-     * Split compensateKw evenly across 3 phases and adjust currents.
-     * Bump total active power by (compensateKw * 1000).
-     */
-    private void applyCompensationThreePhase(short[] words, double compensateKw) {
-        final double pf = clamp(minPowerFactor, 0.1, 1.0);
-        final double perPhaseKw = safeDiv(compensateKw, 3.0);
+            if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
+            if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
+            if (a3) writeI32be(out, REG_P3,   toRawPower(p3Pub,  PT, CT));
+            writeI32be(out, REG_PTOT, toRawPower(pTotPub, PT, CT));
 
-        // L1
-        double v1 = readSafe(words, registerMap.vL1());
-        double i1 = readSafe(words, registerMap.iL1());
-        double addI1 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v1 * pf)));
-        i1 += addI1;
-        writeIfPresent(words, registerMap.iL1(), (float) i1);
+            lastPubMs   = now;
+            lastPubP1W  = p1Pub;
+            lastPubP2W  = p2Pub;
+            lastPubP3W  = p3Pub;
+            lastPubTotW = pTotPub;
 
-        // L2 (if mapped)
-        if (hasRegister(registerMap.vL2()) && hasRegister(registerMap.iL2())) {
-            double v2 = readSafe(words, registerMap.vL2());
-            double i2 = readSafe(words, registerMap.iL2());
-            double addI2 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v2 * pf)));
-            i2 += addI2;
-            writeIfPresent(words, registerMap.iL2(), (float) i2);
+            return out;
         }
 
-        // L3 (if mapped)
-        if (hasRegister(registerMap.vL3()) && hasRegister(registerMap.iL3())) {
-            double v3 = readSafe(words, registerMap.vL3());
-            double i3 = readSafe(words, registerMap.iL3());
-            double addI3 = safeDiv((perPhaseKw * 1000.0), (Math.max(100.0, v3 * pf)));
-            i3 += addI3;
-            writeIfPresent(words, registerMap.iL3(), (float) i3);
+        // ----- COMPENSATION MODE (your existing logic, but without resetting slew) -----
+        final double biasW  = compensateKw * 1000.0;
+        final double pTotDesiredW = pTotW - biasW;
+        final double dW = pTotDesiredW - pTotW;
+        double perAlive = dW / alive;
+
+        double dP1 = a1 ? (p1W + perAlive) : p1W;
+        double dP2 = a2 ? (p2W + perAlive) : p2W;
+        double dP3 = a3 ? (p3W + perAlive) : p3W;
+
+        long now = System.currentTimeMillis();
+        double dtSec = (lastPubMs == 0L) ? 1.0 : Math.max(0.2, (now - lastPubMs) / 1000.0);
+        double stepMaxW = Math.max(0.0, publishRateLimitKwPerSec) * 1000.0 * dtSec;
+
+        double p1Pub = limitSlew(lastPubP1W, dP1, stepMaxW);
+        double p2Pub = limitSlew(lastPubP2W, dP2, stepMaxW);
+        double p3Pub = limitSlew(lastPubP3W, dP3, stepMaxW);
+
+        // cap total purchase
+        double[] capped = capTotalImport3(p1Pub, p2Pub, p3Pub, a1, a2, a3);
+        p1Pub = capped[0]; p2Pub = capped[1]; p3Pub = capped[2];
+        double pTotPub = p1Pub + p2Pub + p3Pub;
+
+        if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
+        if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
+        if (a3) writeI32be(out, REG_P3,   toRawPower(p3Pub,  PT, CT));
+        writeI32be(out, REG_PTOT, toRawPower(pTotPub, PT, CT));
+
+        lastPubMs   = now;
+        lastPubP1W  = p1Pub;
+        lastPubP2W  = p2Pub;
+        lastPubP3W  = p3Pub;
+        lastPubTotW = pTotPub;
+
+        return out;
+    }
+
+
+    // ====== helpers ======
+
+    private void resetSlew() {
+        lastPubMs = 0L;
+        lastPubP1W = lastPubP2W = lastPubP3W = lastPubTotW = Double.NaN;
+    }
+
+    // shared helper: cap total purchase and spread correction across alive phases
+    private double[] capTotalImport3(double p1, double p2, double p3,
+                                     boolean a1, boolean a2, boolean a3) {
+        int alive = (a1?1:0) + (a2?1:0) + (a3?1:0);
+        if (alive == 0) return new double[]{p1, p2, p3};
+        double pTot = p1 + p2 + p3;
+        double maxImportW = Math.max(0.0, maxGridPurchaseKw) * 1000.0;
+        if (pTot < -maxImportW) {
+            double need = (-maxImportW) - pTot; // >0 we must add across phases
+            double per  = need / alive;
+            if (a1) p1 += per;
+            if (a2) p2 += per;
+            if (a3) p3 += per;
+            if (log.isDebugEnabled()) {
+                log.debug("Cap grid-purchase from {} kW to {} kW (alive={})",
+                        -(pTot/1000.0), maxGridPurchaseKw, alive);
+            }
         }
-
-        // bump total active power (W)
-        double pTot = readSafe(words, registerMap.pTotal());
-        pTot += (compensateKw * 1000.0);
-        writeIfPresent(words, registerMap.pTotal(), (float) pTot);
-
-        // optionally bump per-phase power (if mapped)
-        bumpPerPhasePower(words, (float) perPhaseKw);
-
-        log.debug("compensation_applied totalAddKw={} perPhaseKw={} pf={}", compensateKw, perPhaseKw, pf);
+        return new double[]{p1, p2, p3};
     }
 
-    private void bumpPerPhasePower(short[] words, float perPhaseKw) {
-        float addW = perPhaseKw * 1000f;
-        if (hasRegister(registerMap.pL1())) writeIfPresent(words, registerMap.pL1(), readSafe(words, registerMap.pL1()) + addW);
-        if (hasRegister(registerMap.pL2())) writeIfPresent(words, registerMap.pL2(), readSafe(words, registerMap.pL2()) + addW);
-        if (hasRegister(registerMap.pL3())) writeIfPresent(words, registerMap.pL3(), readSafe(words, registerMap.pL3()) + addW);
+    private static double median3WithNaN(double a, double b, double c) {
+        // handle NaNs: use the finite subset's median/mean
+        boolean fa = Double.isFinite(a), fb = Double.isFinite(b), fc = Double.isFinite(c);
+        int cnt = (fa?1:0) + (fb?1:0) + (fc?1:0);
+        if (cnt >= 3) return med3(a,b,c);
+        if (cnt == 2) {
+            double x = fa ? a : (fb ? b : c);
+            double y = (fa && fb) ? b : (fa && fc) ? c : (fb && fc) ? c : x; // pick the other finite
+            return 0.5*(x+y);
+        }
+        return fa ? a : fb ? b : c; // best-effort
     }
 
-    /** Safe float read via codec; returns 0 if the register is missing or out of range. */
-    private float readSafe(short[] words, int wordOffset) {
-        if (!hasRegister(wordOffset)) return 0f;
-        return codec.readFloatOrDefault(words, wordOffset, 0f);
+    private static double med3(double a,double b,double c){
+        if (a>b){double t=a;a=b;b=t;} if (b>c){double t=b;b=c;c=t;} if (a>b){double t=a;a=b;b=t;}
+        return b;
     }
 
-    /** Safe float write: no-op if the register is missing or out of range. */
-    private void writeIfPresent(short[] words, int wordOffset, float value) {
-        if (!hasRegister(wordOffset)) return;
-        int last = wordOffset + 1;
-        if (last >= words.length) return;
-        codec.writeFloat(words, wordOffset, value);
+    private static short[] ensureCapacity(short[] src, int minLen) {
+        if (src == null) return new short[minLen];
+        if (src.length >= minLen) return src.clone();
+        short[] dst = new short[minLen];
+        System.arraycopy(src, 0, dst, 0, src.length);
+        return dst;
     }
 
-    /** Treat negative offsets (e.g., -1) as “not mapped”. */
-    private boolean hasRegister(int wordOffset) {
-        return wordOffset >= 0;
+    private static int u16(short[] a, int i) {
+        if (a == null || i < 0 || i >= a.length) return 0;
+        return a[i] & 0xFFFF;
     }
 
-    /**
-     * Linear ramp towards target over rampMs.
-     * Assumes caller is invoked roughly once per second.
-     */
-    private float rampTowards(float current, float target, long rampMs) {
-        if (rampMs <= 0) return target;
-        float perSec = 1.0f / Math.max(1f, (rampMs / 1000f));
-        float delta = target - current;
-        float step = Math.abs(delta) * perSec;
-        return current + Math.copySign(Math.min(Math.abs(delta), step), delta);
+    private static int i32be(short[] a, int msw) {
+        if (a == null || msw < 0 || msw + 1 >= a.length) return 0;
+        int hi = u16(a, msw);
+        int lo = u16(a, msw + 1);
+        return (hi << 16) | lo;
     }
 
-    /** Treat meter offline/zero-volt as stale and command zeros */
-    private boolean isOffline(short[] words) {
-        double v1 = readSafe(words, registerMap.vL1());
-        double v2 = hasRegister(registerMap.vL2()) ? readSafe(words, registerMap.vL2()) : v1;
-        double v3 = hasRegister(registerMap.vL3()) ? readSafe(words, registerMap.vL3()) : v1;
+    private static void writeI32be(short[] a, int msw, int value) {
+        if (a == null || msw < 0 || msw + 1 >= a.length) return;
+        a[msw]     = (short)((value >>> 16) & 0xFFFF);
+        a[msw + 1] = (short)( value         & 0xFFFF);
+    }
+
+    private int toRawPower(double watts, double PT, double CT) {
+        final double den = Math.max(1e-6, PT * CT);
+        final double raw = watts / den;
+        if (raw > Integer.MAX_VALUE) return Integer.MAX_VALUE;
+        if (raw < Integer.MIN_VALUE) return Integer.MIN_VALUE;
+        return (int) Math.round(raw);
+    }
+
+    private boolean acrelOffline(short[] w, double PT) {
+        final double v1 = 0.1 * u16(w, REG_V1) * PT;
+        final double v2 = 0.1 * u16(w, REG_V2) * PT;
+        final double v3 = 0.1 * u16(w, REG_V3) * PT;
         return (v1 < 1.0 && v2 < 1.0 && v3 < 1.0);
+    }
+
+    private double limitSlew(double prev, double target, double stepMaxW) {
+        if (!Double.isFinite(prev)) return target; // first publish after reset
+        double lo = prev - stepMaxW, hi = prev + stepMaxW;
+        return Math.max(lo, Math.min(hi, target));
     }
 }

@@ -3,22 +3,27 @@ serial:
     port: ${SERIAL_INPUT_PORT:COM7}
     baudRate: ${SERIAL_INPUT_BAUD:9600}
     slaveId: ${SERIAL_INPUT_SLAVE:1}
-    startOffset: ${SERIAL_INPUT_OFFSET:0}
     pollInterval: ${SERIAL_INPUT_POLL:1000}
-    numberOfRegisters: ${SERIAL_INPUT_REGS:72}
     # delay before first attempt (ms) — helps after hard restarts on Windows
     initialOpenDelayMs: ${SERIAL_INITIAL_OPEN_DELAY_MS:2000}
     # extra backoff after a failed read/open (ms)
     reopenBackoffMs: ${SERIAL_REOPEN_BACKOFF_MS:2000}
     warmupMs: ${SERIAL_WARMUP_MS:2000}
     timeoutsBeforeReopen: ${SERIAL_TIMEOUTS_BEFORE_REOPEN:3}
+    meterStaleMs: ${SERIAL_METER_STALE:30000}
+    maxWindowErrorsBeforeReopen: 3
+    staleAlertMinPeriodMs: 10000
 
   output:
     port: ${SERIAL_OUTPUT_PORT:COM11}
     baudRate: ${SERIAL_OUTPUT_BAUD:9600}
     slaveId: ${SERIAL_OUTPUT_SLAVE:1}
-    startOffset: ${SERIAL_OUTPUT_OFFSET:0}
     pollInterval: ${SERIAL_OUTPUT_POLL:1000}
+    initRegisters: ${SERIAL_OUTPUT_INIT_REGS:0}
+    maxSmAgeForWriteMs: 60000      # don’t publish if the meter snapshot is older
+    outStaleMs: 30000              # alert if we haven’t written in this long
+    deferOpenUntilFirstFrame: true   # don’t open slave until first fresh SM frame
+    republishOnStale: true           # keep last good frame flowing when SM pauses
 
 devtools:
   restart:
@@ -38,11 +43,14 @@ solis:
     uri: ${SOLIS_URI}
   fetch:
     periodSeconds: ${SOLIS_FETCH_PERIOD_SECONDS:10}     # how often to call Solis API
-  minImportKw: ${SOLIS_MIN_IMPORT_KW:0.2}               # ignore grid import below this (deadband)
+  minImportKw: ${SOLIS_MIN_IMPORT_KW:1.0}               # ignore grid import below this (deadband)
   maxDataAgeMs: ${SOLIS_MAX_DATA_AGE_MS:300000}         # if no API updates for this long, treat delta as 0
   smoothingFactor: ${SOLIS_SMOOTHING_FACTOR:0.8}        # 0..1 (1.0 = no smoothing)
   # compensation switch (default ON). Can be overridden by env SOLIS_OVERRIDE_ENABLED=true/false
   overrideEnabled: ${SOLIS_OVERRIDE_ENABLED:true}
+  http:
+    graceMs: 60000           # 60s of continuous failure before SOLIS_DOWN is raised
+  importFloorKw: ${SOLIS_IMPORT_FLOOR:2.0}
 
 logging:
   level:
@@ -59,7 +67,15 @@ smartmetr:
     maxKw: ${SMARTMETR_CLAMP_MAX_KW:50}
   staleToZeroMs: ${SMARTMETR_STALE_TO_ZERO_MS:300000}
   rampDownMs: ${SMARTMETR_RAMP_DOWN_MS:2000}
-  floatOrder: ${SMARTMETR_FLOAT_ORDER:BE}
+  scale:
+    pt: ${SMARTMETR_ACREL_PT:1.0}
+    ct: ${SMARTMETR_ACREL_CT:30.0}
+  editCurrents: false
+  publish:
+    rateLimitKwPerSec: ${SMARTMETR_PUBLISH_RATELIMITKW:2.0}
+    rateLimitNeutralKwPerSec: 1.0
+    maxGridPurchaseKw: ${SMARTMETR_PUBLISH_MAX_GRID_PURCHASEKW:29.0}
+
 
 management:
   endpoints:
@@ -80,18 +96,6 @@ management:
     git:
       mode: full
 
-meterMap:
-  vL1:    ${METERMAP_VL1:0}
-  iL1:    ${METERMAP_IL1:6}
-  pTotal: ${METERMAP_PTOTAL:52}
-  vL2:    ${METERMAP_VL2:2}
-  vL3:    ${METERMAP_VL3:4}
-  iL2:    ${METERMAP_IL2:8}
-  iL3:    ${METERMAP_IL3:10}
-  pL1:    ${METERMAP_PL1:12}
-  pL2:    ${METERMAP_PL2:14}
-  pL3:    ${METERMAP_PL3:16}
-
 alert:
   telegram:
     enabled: ${ALERT_TELEGRAM_ENABLED:false}
@@ -104,3 +108,4 @@ alert:
     heartbeat:
       enabled: ${ALERT_TELEGRAM_HEARTBEAT_ENABLED:true}
       cron: "0 0 10 * * *"   # every day 10:00 local time
+
