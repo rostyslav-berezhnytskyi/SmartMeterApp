@@ -70,6 +70,9 @@ public class ModbusInverterFeeder {
     @Value("${serial.output.republishOnStale:true}")
     private boolean republishOnStale;
 
+    /** How long after first GOOD meter frame we stay in pure pass-through mode (ms). */
+    @Value("${serial.output.warmupPassThroughMs:10000}")
+    private long warmupPassThroughMs;                    // NEW
 
     // ===== Runtime state =====
     private final Object lock = new Object();
@@ -79,6 +82,9 @@ public class ModbusInverterFeeder {
 
     private volatile short[] outputData;          // last frame we published (for UI)
     private volatile long lastWriteMs = 0L;       // last successful publish time
+
+    /** Time of first good (fresh) SM frame after start/restart. */
+    private volatile long firstGoodFrameAt = 0L;         // NEW
 
     // ===== Lifecycle =====
     @PostConstruct
@@ -120,8 +126,27 @@ public class ModbusInverterFeeder {
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
 
             // Honor initRegisters, but never block on a big prefill—start at 0 length.
-            int initialLen = Math.max(0, initRegisters);   // with the new default this is 0
+            int initialLen = Math.max(0, initRegisters);
             AtomicSnapshotImage newImage = new AtomicSnapshotImage(slaveId, initialLen);
+
+            // --------------------------------------------------------------------------
+            // !!! CRITICAL MODBUS STARTUP FIX !!!
+            // Pre-load the image with the last known SM snapshot, ensuring the
+            // inverter never reads an all-zero image on the first poll after restart.
+            // --------------------------------------------------------------------------
+            SmSnapshot staleSnap = smReader.getLatestSnapshotSM(); // Get current volatile state
+            if (staleSnap != null && staleSnap.updatedAtMs != 0L) {
+                // Prepare a non-compensated (0.0 kW) frame using the stale data.
+                // This is safe because it only uses the raw meter data to build the frame structure.
+                short[] initialFrame = powerControl.prepareOutputWords(staleSnap, 0.0);
+                newImage.publish(initialFrame);
+                log.info("Inverter-slave image pre-loaded with {} registers of LATEST KNOWN METER data.",
+                        initialFrame.length);
+            } else {
+                log.warn("Inverter-slave image started with zero data. Waiting for first SM frame.");
+            }
+            // --------------------------------------------------------------------------
+
 
             newSlave.addProcessImage(newImage);
             newSlave.start();
@@ -157,6 +182,7 @@ public class ModbusInverterFeeder {
                 up = false;
             }
         }
+        firstGoodFrameAt = 0L;  // reset warmup marker on close
         log.info("Inverter-slave closed");
     }
 
@@ -171,8 +197,8 @@ public class ModbusInverterFeeder {
             // 1) latest meter snapshot
             SmSnapshot snap = smReader.getLatestSnapshotSM();
 
-            // No first frame yet → keep last frame alive if any
             if (snap == null || snap.updatedAtMs == 0L) {
+                // No first frame yet → keep last frame alive if any
                 alerts.raise("INVERTER_FEEDER_WAITING_FOR_METER", "Waiting for first meter frame…",
                         AlertService.Severity.WARN);
                 if (republishOnStale && outputData != null) {
@@ -186,35 +212,51 @@ public class ModbusInverterFeeder {
             long now = System.currentTimeMillis();
             long smAge = now - snap.updatedAtMs;
 
-            // 2) If SM input is stale → re-publish last good frame (do NOT send zeros)
+            // 2) stale SM input → keep last good frame (fail-safe)
             if (smAge > Math.max(0L, maxSmAgeForWriteMs)) {
                 alerts.raise("INVERTER_FEEDER_STALE_INPUT",
                         "Meter input stale: " + smAge + " ms (>" + maxSmAgeForWriteMs + " ms)",
                         AlertService.Severity.ERROR);
                 if (republishOnStale && outputData != null) {
+                    // keep feeding last known good data
                     publishFullFrame(outputData);
-                    return;
-                } else {
-                    return; // image keeps previous contents
                 }
+                return;
             } else {
                 alerts.resolve("INVERTER_FEEDER_STALE_INPUT");
             }
 
-            // 3) Build full outgoing image (pass-through when override OFF)
-            double deltaKw = loadOverride.getCurrentDeltaKw();
+            // 3) mark first good frame time
+            if (firstGoodFrameAt == 0L) {
+                firstGoodFrameAt = now;
+            }
+
+            // 4) Decide: pass-through vs compensated
+            boolean inWarmup = (now - firstGoodFrameAt) < Math.max(0L, warmupPassThroughMs);
+
+            final double deltaKw;
+            if (inWarmup) {
+                // First N ms: behave like a transparent SM → no override
+                deltaKw = 0.0;
+            } else {
+                // Normal mode: use override (this already returns 0 if stale/disabled)
+                deltaKw = loadOverride.getCurrentDeltaKw();
+            }
+
+            // 5) Build outgoing image
             short[] frame = powerControl.prepareOutputWords(snap, deltaKw);
 
-            // 4) Publish WHOLE FRAME (04 & 03)
+            // 6) Publish WHOLE FRAME
             publishFullFrame(frame);
 
-            // success → resolve write alerts
             alerts.resolve("INVERTER_WRITE_FAIL");
             alerts.resolve("INVERTER_OUTPUT_STALE");
 
             if (log.isDebugEnabled()) {
-                log.debug("Compensate={} kW; wrote {} regs (min..max={}..{})",
-                        deltaKw, Math.max(initRegisters, frame.length), 0, Math.max(initRegisters, frame.length) - 1);
+                log.debug("Warmup={} deltaKw={} kW; wrote {} regs (min..max=0..{})",
+                        inWarmup, deltaKw,
+                        Math.max(initRegisters, frame.length),
+                        Math.max(initRegisters, frame.length) - 1);
             }
 
         } catch (Exception e) {
@@ -264,6 +306,7 @@ public class ModbusInverterFeeder {
 
     // single place that writes the WHOLE frame to 04 & 03
     private void publishFullFrame(short[] frame) {
+
         AtomicSnapshotImage img = image;
         if (img == null) return;
         img.publish(frame);
