@@ -273,13 +273,12 @@ public class ModbusSmReader {
         }
     }
 
+    /** Genuine thread crash (not CRC noise) — close master so the poll loop reopens it. */
     @EventListener
     public void onModbusCrash(ModbusCrashedEvent evt) {
         if (stopping) return;
-        log.warn("modbus_crash_event → forcing reopen (cause: {})", evt.cause().toString());
+        log.warn("modbus_uncaught → closing meter port for reopen (cause: {})", evt.cause().toString());
         closeQuietly();
-        try { Thread.sleep(Math.min(3000, Math.max(500, pollInterval))); }
-        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 
     private void sleepQuiet(long ms) {

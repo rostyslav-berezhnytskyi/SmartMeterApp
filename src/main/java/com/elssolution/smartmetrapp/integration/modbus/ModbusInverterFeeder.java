@@ -1,6 +1,7 @@
 package com.elssolution.smartmetrapp.integration.modbus;
 
 import com.elssolution.smartmetrapp.alerts.AlertService;
+import com.elssolution.smartmetrapp.alerts.ModbusCrashedEvent;
 import com.elssolution.smartmetrapp.domain.SmSnapshot;
 import com.elssolution.smartmetrapp.service.LoadOverrideService;
 import com.elssolution.smartmetrapp.service.PowerControlService;
@@ -15,6 +16,8 @@ import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+
+import org.springframework.context.event.EventListener;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -258,6 +261,14 @@ public class ModbusInverterFeeder {
         if (s == null || s.updatedAtMs == 0L) return false;
         long age = System.currentTimeMillis() - s.updatedAtMs;
         return age <= Math.max(0L, maxAgeMs);
+    }
+
+    /** Genuine thread crash (not CRC noise) — close slave so ensureOpen() restarts it. */
+    @EventListener
+    public void onModbusCrash(ModbusCrashedEvent evt) {
+        if (!up) return;
+        log.warn("modbus_uncaught → closing inverter slave for reopen (cause: {})", evt.cause().toString());
+        closeQuietly();
     }
 
     // single place that writes the WHOLE frame to 04 & 03
