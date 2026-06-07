@@ -12,7 +12,6 @@ public class PowerControlService {
     // ====== Config (from application.yml) ======
     @Value("${smartmetr.scale.pt:1.0}")        private double pt;
     @Value("${smartmetr.scale.ct:1.0}")        private double ct;
-    @Value("${smartmetr.cosPhiMin:0.95}")      private double minPf;
     @Value("${smartmetr.staleToZeroMs:300000}")private long   maxAgeMs;
 
     /** A phase is considered "alive" if its phase-to-neutral V >= this. */
@@ -28,6 +27,21 @@ public class PowerControlService {
     /** Max change speed when COMPENSATION is neutral/off (kW/s). */
     @Value("${smartmetr.publish.rateLimitNeutralKwPerSec:1.0}")
     private double publishRateLimitNeutralKwPerSec;
+
+    /**
+     * Hard cap: never publish more than this many kW of apparent import to the inverter.
+     * In this meter's sign convention, import is negative P, so the cap is pTotPub >= -(this * 1000).
+     * Set just below the inverter's rated capacity — 29 kW for a 30 kW unit.
+     */
+    @Value("${smartmetr.publish.maxApparentImportKw:29.0}")
+    private double maxApparentImportKw;
+
+    /**
+     * Near-zero bias (W). If |pTotPub| < this value, clamp to -nearZeroBiasW to prevent
+     * the published setpoint from hovering exactly at 0 and causing inverter oscillation.
+     */
+    @Value("${smartmetr.publish.nearZeroBiasW:80.0}")
+    private double nearZeroBiasW;
 
     // ====== Acrel register addresses ======
     private static final int REG_V1   =  97;
@@ -118,9 +132,16 @@ public class PowerControlService {
             double p3Pub = limitSlew(lastPubP3W, targetP3, stepMaxW);
             double pTotPub = p1Pub + p2Pub + p3Pub;
 
-            // small negative bias to avoid dithering at exactly zero
-            final double biasMinW = 0;
-            if (Math.abs(pTotPub) < biasMinW) pTotPub = -biasMinW;
+            // Near-zero bias: avoid hovering exactly at 0 W which can cause inverter oscillation
+            if (nearZeroBiasW > 0 && Math.abs(pTotPub) < nearZeroBiasW) pTotPub = -nearZeroBiasW;
+
+            // Safety cap: never show more than maxApparentImportKw to the inverter
+            double capW = maxApparentImportKw * 1000.0;
+            if (capW > 0 && pTotPub < -capW) {
+                double scale = capW / (-pTotPub);
+                p1Pub *= scale; p2Pub *= scale; p3Pub *= scale;
+                pTotPub = p1Pub + p2Pub + p3Pub;
+            }
 
             if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
             if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));
@@ -136,11 +157,9 @@ public class PowerControlService {
             return out;
         }
 
-        // ----- COMPENSATION MODE (your existing logic, but without resetting slew) -----
+        // ----- COMPENSATION MODE -----
         final double biasW  = compensateKw * 1000.0;
-        final double pTotDesiredW = pTotW - biasW;
-        final double dW = pTotDesiredW - pTotW;
-        double perAlive = dW / alive;
+        double perAlive = -biasW / alive;   // equal share of the bias per alive phase
 
         double dP1 = a1 ? (p1W + perAlive) : p1W;
         double dP2 = a2 ? (p2W + perAlive) : p2W;
@@ -155,8 +174,16 @@ public class PowerControlService {
         double p3Pub = limitSlew(lastPubP3W, dP3, stepMaxW);
         double pTotPub = p1Pub + p2Pub + p3Pub;
 
-        final double biasMinW = 0;
-        if (Math.abs(pTotPub) < biasMinW) pTotPub = -biasMinW;
+        // Near-zero bias: avoid hovering exactly at 0 W which can cause inverter oscillation
+        if (nearZeroBiasW > 0 && Math.abs(pTotPub) < nearZeroBiasW) pTotPub = -nearZeroBiasW;
+
+        // Safety cap: never show more than maxApparentImportKw to the inverter
+        double capW = maxApparentImportKw * 1000.0;
+        if (capW > 0 && pTotPub < -capW) {
+            double scale = capW / (-pTotPub);
+            p1Pub *= scale; p2Pub *= scale; p3Pub *= scale;
+            pTotPub = p1Pub + p2Pub + p3Pub;
+        }
 
         if (a1) writeI32be(out, REG_P1,   toRawPower(p1Pub,  PT, CT));
         if (a2) writeI32be(out, REG_P2,   toRawPower(p2Pub,  PT, CT));

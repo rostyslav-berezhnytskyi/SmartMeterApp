@@ -73,6 +73,8 @@ smartmetr:
   publish:
     rateLimitKwPerSec: ${SMARTMETR_PUBLISH_RATELIMITKW:2.0}
     rateLimitNeutralKwPerSec: 1.0
+    maxApparentImportKw: ${SMARTMETR_MAX_APPARENT_IMPORT_KW:29.0}   # hard cap for inverter safety
+    nearZeroBiasW: ${SMARTMETR_NEAR_ZERO_BIAS_W:80.0}               # anti-oscillation bias near 0 W
 
 
 management:
