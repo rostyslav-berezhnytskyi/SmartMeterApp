@@ -143,7 +143,8 @@ public class LoadOverrideService {
             }
 
             // ---- Target from psum (import only), apply deadband
-            double importKw = (lastPsumKw < 0) ? Math.abs(lastPsumKw) : 0.0;
+            // --- ТЕСТОВИЙ РЯДОК: Примусово кажемо, що ми беремо з мережі 10 кВт ---
+            double importKw = 10.0;
             double target   = (importKw > minImportKw) ? importKw : 0.0;
 
             // Hard clamp
