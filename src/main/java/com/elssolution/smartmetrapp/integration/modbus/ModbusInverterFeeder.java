@@ -73,6 +73,10 @@ public class ModbusInverterFeeder {
     @Value("${serial.output.republishOnStale:true}")
     private boolean republishOnStale;
 
+    /** Diagnostics: log raw RX/TX bytes + turnaround timing on the inverter (slave) port. */
+    @Value("${serial.output.debugRawRx:false}")
+    private boolean debugRawRx;
+
 
     // ===== Runtime state =====
     private final Object lock = new Object();
@@ -118,7 +122,7 @@ public class ModbusInverterFeeder {
 
         try {
             SerialPortWrapper wrapper =
-                    new SerialPortWrapperImpl(port, baudRate, /*read*/300, /*write*/200, /*forSlave*/ true);
+                    new SerialPortWrapperImpl(port, baudRate, /*read*/300, /*write*/200, /*forSlave*/ true, /*debugRaw*/ debugRawRx);
             ModbusSlaveSet newSlave = new ModbusFactory().createRtuSlave(wrapper);
 
             // <<< swap in the atomic image >>>

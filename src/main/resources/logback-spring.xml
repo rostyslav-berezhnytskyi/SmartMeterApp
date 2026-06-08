@@ -26,6 +26,26 @@
         <immediateFlush>true</immediateFlush>
     </appender>
 
+    <!-- DIAGNOSTIC: raw RS-485 RX/TX byte dump (only emits when serial.output.debugRawRx=true).
+         Routed to its own file so it doesn't bloat app.log and is easy to capture/send. -->
+    <appender name="MODBUS-RAW-FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_FILE}.raw</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_FILE}.raw.%d{yyyy-MM-dd}.%i.gz</fileNamePattern>
+            <maxFileSize>50MB</maxFileSize>
+            <totalSizeCap>1GB</totalSizeCap>
+            <maxHistory>7</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{20} - %msg%n</pattern>
+        </encoder>
+        <immediateFlush>true</immediateFlush>
+    </appender>
+
+    <logger name="MODBUS_RAW" level="INFO" additivity="false">
+        <appender-ref ref="MODBUS-RAW-FILE"/>
+    </logger>
+
     <logger name="com.elssolution.smartmetrapp" level="INFO" additivity="false">
         <appender-ref ref="CONSOLE"/>
         <appender-ref ref="FILE-ROLLING"/>

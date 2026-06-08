@@ -24,6 +24,7 @@ serial:
     outStaleMs: 30000              # alert if we haven’t written in this long
     deferOpenUntilFirstFrame: true   # don’t open slave until first fresh SM frame
     republishOnStale: true           # keep last good frame flowing when SM pauses
+    debugRawRx: ${SERIAL_OUTPUT_DEBUG_RAW:false}  # DIAGNOSTIC: log raw RX/TX bytes + turnaround timing
 
 devtools:
   restart:

@@ -22,6 +22,11 @@ public class ModbusErrInterceptor {
 
     private volatile long lastLoggedAt = 0;
 
+    // ---- diagnostics: true CRC-error rate (the sample log above is throttled to 1/10s) ----
+    private volatile long crcCount = 0;        // total CRC mismatches seen
+    private volatile long crcWindowStart = 0;  // start of current reporting window
+    private volatile long crcWindowCount = 0;  // CRC mismatches in current window
+
     @PostConstruct
     public void init() {
         PrintStream originalErr = System.err;
@@ -54,11 +59,28 @@ public class ModbusErrInterceptor {
     }
 
     private void maybeLog(String line) {
-        if (!line.contains("CRC mismatch") && !line.contains("wha")
-                && !line.contains("ModbusTransportException")) return;
+        boolean isCrc = line.contains("CRC mismatch");
+        if (!isCrc && !line.contains("wha") && !line.contains("ModbusTransportException")) return;
+
         long now = System.currentTimeMillis();
+
+        // accurate rate accounting (independent of the throttled sample below)
+        if (isCrc) {
+            crcCount++;
+            crcWindowCount++;
+            if (crcWindowStart == 0) crcWindowStart = now;
+            long windowMs = now - crcWindowStart;
+            if (windowMs >= 5_000) {
+                double perSec = crcWindowCount * 1000.0 / windowMs;
+                log.warn("modbus_crc_rate: {} errors in {} ms ({} /s), total={}",
+                        crcWindowCount, windowMs, String.format("%.1f", perSec), crcCount);
+                crcWindowStart = now;
+                crcWindowCount = 0;
+            }
+        }
+
         if (now - lastLoggedAt > 10_000) {
-            log.warn("modbus_rs485_noise (slave rx, no action needed): {}", line.trim());
+            log.warn("modbus_rs485_noise (slave rx sample): {}", line.trim());
             lastLoggedAt = now;
         }
     }
