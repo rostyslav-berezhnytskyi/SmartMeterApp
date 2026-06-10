@@ -43,6 +43,14 @@ public class PowerControlService {
     @Value("${smartmetr.publish.nearZeroBiasW:80.0}")
     private double nearZeroBiasW;
 
+    /**
+     * Low-pass filter time constant (seconds) applied to the per-phase meter power before
+     * publishing. Damps the inverter↔meter zero-export oscillation (~7 s period) by making the
+     * inverter chase a slow, smooth target instead of its own reflected output. 0 disables it.
+     */
+    @Value("${smartmetr.publish.lowPassTauSec:20.0}")
+    private double lowPassTauSec;
+
     // ====== Acrel register addresses ======
     private static final int REG_V1   =  97;
     private static final int REG_V2   =  98;
@@ -60,6 +68,10 @@ public class PowerControlService {
     private volatile double p2Prev1 = Double.NaN, p2Prev2 = Double.NaN;
     private volatile double p3Prev1 = Double.NaN, p3Prev2 = Double.NaN;
     private volatile double ptPrev1 = Double.NaN, ptPrev2 = Double.NaN;
+
+    // ---- Low-pass filter state (per-phase, smoothed meter power in W) ----
+    private volatile double p1Filt = Double.NaN, p2Filt = Double.NaN, p3Filt = Double.NaN;
+    private volatile long   lastFiltMs = 0L;
 
     // ---- Publish-side slew limiter state ----
     private volatile long   lastPubMs   = 0L;
@@ -107,6 +119,19 @@ public class PowerControlService {
         p2Prev2 = p2Prev1; p2Prev1 = rawP2W;
         p3Prev2 = p3Prev1; p3Prev1 = rawP3W;
         ptPrev2 = ptPrev1; ptPrev1 = rawPTotW;
+
+        // Low-pass filter (first-order): damps the ~7 s inverter↔meter oscillation so the
+        // inverter chases a slow, smooth target instead of its own reflected output.
+        // Time-aware so a missed/late publish cycle does not skew the smoothing.
+        if (lowPassTauSec > 0.0) {
+            long nowF  = System.currentTimeMillis();
+            double dtF = (lastFiltMs == 0L) ? 1.0 : Math.max(0.05, (nowF - lastFiltMs) / 1000.0);
+            p1W = lpf(p1Filt, p1W, dtF, lowPassTauSec); p1Filt = p1W;
+            p2W = lpf(p2Filt, p2W, dtF, lowPassTauSec); p2Filt = p2W;
+            p3W = lpf(p3Filt, p3W, dtF, lowPassTauSec); p3Filt = p3W;
+            pTotW = p1W + p2W + p3W;
+            lastFiltMs = nowF;
+        }
 
         // Alive phases decision
         final double v1 = 0.1 * u16(out, REG_V1) * PT;
@@ -205,6 +230,21 @@ public class PowerControlService {
     private void resetSlew() {
         lastPubMs = 0L;
         lastPubP1W = lastPubP2W = lastPubP3W = lastPubTotW = Double.NaN;
+        // Re-seed the low-pass filter to the next live reading when the meter returns,
+        // so a stale gap does not leave a stale smoothed value chasing back from far away.
+        lastFiltMs = 0L;
+        p1Filt = p2Filt = p3Filt = Double.NaN;
+    }
+
+    /**
+     * First-order low-pass filter (time-aware). y += (dt/(tau+dt)) * (x - y).
+     * Seeds to the input on the first sample; returns input directly when tau <= 0 (disabled).
+     */
+    private static double lpf(double prev, double input, double dtSec, double tauSec) {
+        if (!Double.isFinite(input)) return prev;
+        if (!Double.isFinite(prev) || tauSec <= 0.0) return input; // seed / disabled
+        double alpha = dtSec / (tauSec + dtSec);
+        return prev + alpha * (input - prev);
     }
 
     private static double median3WithNaN(double a, double b, double c) {

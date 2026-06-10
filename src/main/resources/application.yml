@@ -76,6 +76,11 @@ smartmetr:
     rateLimitNeutralKwPerSec: 1.0
     maxApparentImportKw: ${SMARTMETR_MAX_APPARENT_IMPORT_KW:29.0}   # hard cap for inverter safety
     nearZeroBiasW: ${SMARTMETR_NEAR_ZERO_BIAS_W:80.0}               # anti-oscillation bias near 0 W
+    # Low-pass filter time constant (seconds) on the published per-phase power.
+    # Damps the inverter<->meter zero-export oscillation (~7 s period) so the inverter
+    # chases a slow, smooth target instead of its own reflection. 0 disables (legacy behavior).
+    # ~3-5x the oscillation period is a good range; 20 s ≈ 90%+ attenuation of a 7 s swing.
+    lowPassTauSec: ${SMARTMETR_PUBLISH_LOWPASS_TAU_SEC:20.0}
 
 
 management:
